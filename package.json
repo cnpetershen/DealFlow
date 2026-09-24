@@ -1,0 +1,20 @@
+{
+  "name": "dealflow",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Event-driven, human-in-the-loop sales workflow engine",
+  "scripts": {
+    "test": "vitest",
+    "test:run": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.4"
+  }
+}
