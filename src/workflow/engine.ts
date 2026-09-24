@@ -40,19 +40,53 @@ class FactsRejectedError extends Error {
 
 export class WorkflowEngine {
   readonly #o: WorkflowEngineOptions; readonly #type: string; readonly #now: () => string; readonly #actions = new Map<string, ProposedAction>(); readonly #previousDecisions = new Map<string, PreviousDecision[]>(); readonly #failureClassifications = new Map<string, ErrorClassification>();
+  /** 同一 idempotency_key 的在途 handleEvent 合并为一次处理，避免并发重复业务效果。 */
+  readonly #inFlight = new Map<string, Promise<HandleEventResult>>();
   constructor(options: WorkflowEngineOptions) { this.#o=options; this.#type=options.workflow_type ?? 'lead_follow_up'; this.#now=options.now ?? (()=>new Date().toISOString()); }
   async handleEvent(input: ParsedEvent): Promise<HandleEventResult> {
+    const key = input.idempotency_key;
+    const inflight = this.#inFlight.get(key);
+    if (inflight) return inflight;
+    const run = this.#handleEventOnce(input).finally(() => { this.#inFlight.delete(key); });
+    this.#inFlight.set(key, run);
+    return run;
+  }
+  async #handleEventOnce(input: ParsedEvent): Promise<HandleEventResult> {
     const e=input as AnyEvent, stored=this.#o.event_store.append(input);
     if(stored.status==='conflict'){ this.#o.exception_queue.enqueue({occurred_at:this.#now(),reason:'idempotency_conflict',event_id:e.event_id,event:e,subject:null}); return {status:'conflict'}; }
     if(stored.status==='duplicate') return {status:'duplicate',workflow:this.#workflow(e) ?? null};
     try { const workflow=await this.#process(e); this.#o.event_store.markProcessed(e.idempotency_key); return workflow?{status:'processed',workflow}:{status:'unmatched',workflow:null}; }
     catch(error){ const workflow=this.#workflow(e); if(workflow?.status==='running') this.#save(this.#transition(workflow,'processing_error',undefined,msg(error))); this.#o.exception_queue.enqueue({occurred_at:this.#now(),reason:error instanceof FactsRejectedError?error.reason:'processing_error',event_id:e.event_id,event:e,subject:workflow?this.#subject(workflow):null}); return {status:'failed',workflow:workflow??null}; }
   }
-  async retry(id:string):Promise<WorkflowInstanceState>{ const w=this.#require(id); if(w.status!=='failed') throw new Error('Workflow 当前不可重试'); if(this.#failureClassifications.get(id)==='permanent') throw new Error('永久性失败不允许自动重试'); const entry=this.#o.event_store.list().find(x=>x.event.event_id===w.last_processed_event_id); if(!entry) throw new Error('Workflow 没有可重试事件'); const running=this.#save(this.#transition(w,'retry')); const result=await this.#plan(running,entry.event as AnyEvent); this.#o.event_store.markProcessed(entry.event.idempotency_key); return result; }
+  /**
+   * 崩溃恢复：按 sequence 顺序用 EventStore 中的全部事件重建内存 State / Audit / Exception。
+   * 仅应在空 State Store 上调用；已处理事件重新应用事实，pending 事件完整处理并 markProcessed。
+   */
+  async recoverFromEventLog(): Promise<readonly HandleEventResult[]> {
+    const results: HandleEventResult[] = [];
+    for (const { event } of this.#o.event_store.list()) {
+      results.push(await this.#replay(event));
+    }
+    return results;
+  }
+  async #replay(input: ParsedEvent): Promise<HandleEventResult> {
+    const e=input as AnyEvent;
+    try { const workflow=await this.#process(e); this.#o.event_store.markProcessed(e.idempotency_key); return workflow?{status:'processed',workflow}:{status:'unmatched',workflow:null}; }
+    catch(error){ const workflow=this.#workflow(e); if(workflow?.status==='running') this.#save(this.#transition(workflow,'processing_error',undefined,msg(error))); this.#o.exception_queue.enqueue({occurred_at:this.#now(),reason:error instanceof FactsRejectedError?error.reason:'processing_error',event_id:e.event_id,event:e,subject:workflow?this.#subject(workflow):null}); return {status:'failed',workflow:workflow??null}; }
+  }
+  async retry(id:string):Promise<WorkflowInstanceState>{
+    const inflight = this.#retryInFlight.get(id);
+    if (inflight) return inflight;
+    const run = this.#retryOnce(id).finally(() => { this.#retryInFlight.delete(id); });
+    this.#retryInFlight.set(id, run);
+    return run;
+  }
+  readonly #retryInFlight = new Map<string, Promise<WorkflowInstanceState>>();
+  async #retryOnce(id:string):Promise<WorkflowInstanceState>{ const w=this.#require(id); if(w.status!=='failed') throw new Error('Workflow 当前不可重试'); if(this.#failureClassifications.get(id)==='permanent') throw new Error('永久性失败不允许自动重试'); const entry=this.#o.event_store.list().find(x=>x.event.event_id===w.last_processed_event_id); if(!entry) throw new Error('Workflow 没有可重试事件'); const running=this.#save(this.#transition(w,'retry')); const result=await this.#plan(running,entry.event as AnyEvent); this.#o.event_store.markProcessed(entry.event.idempotency_key); return result; }
   approve(id:string,actionId:string,actorId:string){return this.#review(id,actionId,actorId,true,null)}
   reject(id:string,actionId:string,actorId:string,reason:string){return this.#review(id,actionId,actorId,false,reason)}
   cancel(id:string,actorId='system'){const next=this.#save(this.#transition(this.#require(id),'cancel_requested')); this.#audit(null,next,'state_transitioned',null,`cancelled by ${actorId}`,'succeeded'); return next;}
-  async #process(e:AnyEvent):Promise<WorkflowInstanceState|null>{ if(e.type==='lead.created') return this.#create(e); const w=this.#workflow(e); if(!w){this.#unmatched(e);return null;} if(isWorkflowTerminal(w.status)||(w.status==='waiting_result'&&!this.#matches(w,e))){this.#unmatched(e,w);return null;} this.#facts(e); let current:WorkflowInstanceState={...w,last_processed_event_id:e.event_id,updated_at:this.#now()}; if(w.status==='waiting_result') current=this.#transition(current,'result_event_matched'); current=this.#save(current); this.#audit(e,current,'event_processed',null,null,'succeeded'); return this.#plan(current,e); }
+  async #process(e:AnyEvent):Promise<WorkflowInstanceState|null>{ if(e.type==='lead.created') return this.#create(e); const w=this.#workflow(e); if(!w){this.#unmatched(e);return null;} if(isWorkflowTerminal(w.status)||(w.status==='waiting_result'&&!this.#matches(w,e))){this.#unmatched(e,w);return null;} this.#facts(e); let current:WorkflowInstanceState={...w,last_processed_event_id:e.event_id,updated_at:this.#now()}; if(current.status==='failed') current=this.#transition(current,'retry'); else if(w.status==='waiting_result') current=this.#transition(current,'result_event_matched'); current=this.#save(current); this.#audit(e,current,'event_processed',null,null,'succeeded'); return this.#plan(current,e); }
   #create(e:AnyEvent){const p=e.payload; if(!this.#o.lead_store.get(p.lead_id)){this.#o.lead_store.save({lead_id:p.lead_id,source_channel:p.source_channel,source_record_id:p.source_record_id,company_name:p.company_name,contact_id:p.contact_id,owner_id:p.initial_owner_id,status:'new',created_at:e.occurred_at,updated_at:e.occurred_at}); if(p.contact_id&&this.#o.contact_defaults)this.#o.contact_store.save(this.#o.contact_defaults(p.contact_id));} const key=workflowBusinessKey({workflow_type:this.#type,subject_type:'lead',subject_id:p.lead_id}), old=this.#o.workflow_store.findByBusinessKey(key); if(old)return old; const pending:WorkflowInstanceState={workflow_instance_id:`wf_${this.#type}_${p.lead_id}`,workflow_type:this.#type,subject_type:'lead',subject_id:p.lead_id,status:'pending',current_step:'assignment',awaiting_event_types:[],plan_version:1,last_processed_event_id:e.event_id,created_at:e.occurred_at,updated_at:this.#now()}; return this.#save(this.#transition(pending,'started'));}
   #facts(e:AnyEvent){const p=e.payload;if(['lead.assigned','email.sent','email.replied','meeting.scheduled','task.overdue'].includes(e.type)){const lead=this.#o.lead_store.get(p.lead_id);if(!lead)throw new Error('Lead 不存在');const t=validateLeadTransition(lead.status,e.type);if(!t.allowed)throw new FactsRejectedError('invalid_transition',t.detail);this.#o.lead_store.save({...lead,owner_id:e.type==='lead.assigned'?p.owner_id:lead.owner_id,status:t.to[0]!,updated_at:e.occurred_at});return;} if(e.type==='deal.created'){if(this.#o.deal_store.get(p.deal_id))return;const t=validateDealTransition(null,e.type,p.initial_stage);if(!t.allowed)throw new FactsRejectedError('invalid_transition',t.detail);this.#o.deal_store.save({deal_id:p.deal_id,lead_id:p.lead_id,contact_id:p.contact_id,owner_id:p.owner_id,stage:p.initial_stage,amount:p.amount,currency:p.currency,expected_close_at:p.expected_close_at,outcome:null,created_at:e.occurred_at,updated_at:e.occurred_at});return;} const deal=this.#o.deal_store.get(p.deal_id);if(!deal)throw new Error('Deal 不存在');const to=e.type==='proposal.sent'?'proposal':p.to_stage;if(e.type==='deal.stage_changed'&&deal.stage!==p.from_stage)throw new FactsRejectedError('stale_event','Deal 当前阶段与事件冲突');const t=validateDealTransition(deal.stage,e.type,to);if(!t.allowed)throw new FactsRejectedError('invalid_transition',t.detail);this.#o.deal_store.save({...deal,stage:to,outcome:to==='won'||to==='lost'?(p.reason??deal.outcome):deal.outcome,updated_at:e.occurred_at});}
   async #plan(w:WorkflowInstanceState,e:AnyEvent|null):Promise<WorkflowInstanceState>{const base=w.status==='running'||w.status==='replanning'?w:this.#transition(w,'result_event_matched');const current=this.#save({...base,plan_version:base.plan_version+1,updated_at:this.#now()}),ctx=this.#context(current,e?.occurred_at??this.#now()),actions=this.#o.decider.decide(ctx);if(!actions.length){if(e?.type==='email.sent')return this.#save({...current,status:'waiting_result',current_step:'await_reply',awaiting_event_types:['email.replied','task.overdue']});return this.#save(this.#transition(current,'workflow_finished'));}let result=current;for(const action of actions){this.#actions.set(action.action_id,deepFreezeClone(action));this.#audit(e,result,'decision_proposed',action,action.reason,'pending');const outcome=this.#o.policy.evaluate(action,ctx);this.#audit(e,result,outcome.decision==='reject'?'policy_rejected':'policy_evaluated',action,reason(outcome),outcome.decision==='auto'?'succeeded':outcome.decision==='reject'?'failed':'pending');if(outcome.decision==='reject')continue;if(outcome.decision==='human_review'){result=this.#save(result.status==='replanning'?this.#transition(result,'replan_completed','needs_review'):this.#transition(result,'approval_required'));continue;}try{if(result.status==='replanning')result=this.#transition(result,'replan_completed','running');await this.#o.executor.execute(action);this.#failureClassifications.delete(result.workflow_instance_id);result=this.#save({...this.#transition(result,'action_dispatched'),current_step:action.action_type,awaiting_event_types:RESULT[action.action_type]??[]});this.#audit(e,result,'action_dispatched',action,null,'succeeded');}catch(error){const classified=classifyExecutionError(error);this.#failureClassifications.set(result.workflow_instance_id,classified.classification);this.#audit(e,result,'action_failed',action,`${classified.classification}: ${classified.message}`,'failed');result=this.#save(this.#transition(result,'processing_error',undefined,msg(error)));}}return result;}

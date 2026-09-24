@@ -39,6 +39,7 @@
 | --- | --- | --- | --- | --- |
 | Lead `new` | `lead.created` | 事件首次处理成功 | `new` | 创建或幂等获取 WorkflowInstance，进入分配决策 |
 | Lead `new` | `lead.assigned` | `owner_id` 有效 | `assigned` | 从分配节点恢复，计算首次跟进动作 |
+| Lead `assigned` | `lead.assigned` | 同一分配事实重放（至少一次投递） | `assigned` | 幂等合并，不重复推进流程 |
 | Lead `assigned` | `email.sent` | 邮件发出且关联当前 Lead | `assigned` | 等待回复或超时结果 |
 | Lead `assigned` | `email.replied` | 回复可匹配联系人或线程 | `engaged` | 进入互动结果处理，可能提出会议动作 |
 | Lead `engaged` | `meeting.scheduled` | 会议属于当前 Lead/Contact | `qualified` 或 `engaged` | 等待会议结果或后续销售动作 |
@@ -83,3 +84,4 @@ Workflow 的触发器与 Lead/Deal 不同：它既可以是外部事件（例如
 8. **失败可重试**：事件已落库但处理失败时，重试必须复用同一个 `idempotency_key`，不能产生第二次业务效果。失败分类为 `transient`（含 TIMEOUT）时允许自动重试；分类为 `permanent` 时 `retry` 必须拒绝。失败分类与审计关系见 `docs/domain.md`「Executor Error Contract」与「Audit 契约」。
 9. **终态保护**：Lead 已 `disqualified`/`closed` 或 Deal 已 `won`/`lost` 后，默认不再自动恢复原 Workflow；新事实只能产生明确的后续流程或人工审核。
 10. **审计先行**：状态迁移、Decision、Policy 结论、人工操作和执行结果均追加 Audit Log，Audit Log 不可修改。
+11. **崩溃恢复重放**：EventStore 中的事件是恢复的唯一事实来源。重启后对空 State Store 调用 `recoverFromEventLog()`，按 `sequence` 重放全部事件重建 State；`pending` 事件完整处理并 `markProcessed`，已处理事件幂等重放。事件仍为 `pending` 且 Workflow 已是 `failed` 时，重投事件按 `retry` 语义先恢复 `running` 再规划。

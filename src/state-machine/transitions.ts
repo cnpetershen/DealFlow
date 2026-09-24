@@ -76,6 +76,13 @@ export const LEAD_TRANSITIONS: readonly TransitionRow<LeadStatus, EventType>[] =
   },
   {
     from: 'assigned',
+    trigger: 'lead.assigned',
+    to: ['assigned'],
+    condition: '同一分配事实重放（至少一次投递），幂等合并',
+    workflow_action: '不重复推进流程，允许处理中断后的恢复',
+  },
+  {
+    from: 'assigned',
     trigger: 'email.sent',
     to: ['assigned'],
     condition: '邮件发出且关联当前 Lead',
