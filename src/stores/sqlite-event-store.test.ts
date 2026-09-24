@@ -118,6 +118,69 @@ describe('SqliteEventStore 持久化与恢复', () => {
     }
   });
 
+  it('同一 pending 事件仅一个 claimId 可持有租约', () => {
+    const path = tempDbPath();
+    try {
+      const workerA = new SqliteEventStore({ path });
+      const workerB = new SqliteEventStore({ path });
+      workerA.append(leadCreatedEvent());
+      const key = 'lead.created:crm:rec_1001';
+
+      expect(workerA.tryClaim(key, 'claim-a', 1_000, 30_000)).toBe(true);
+      expect(workerB.tryClaim(key, 'claim-b', 1_000, 30_000)).toBe(false);
+
+      workerA.releaseClaim(key, 'claim-a');
+      expect(workerB.tryClaim(key, 'claim-b', 1_000, 30_000)).toBe(true);
+
+      workerA.close();
+      workerB.close();
+    } finally {
+      rmSync(join(path, '..'), { recursive: true, force: true });
+    }
+  });
+
+  it('租约过期后可被其他 worker 接管；processed 后不可再 claim', () => {
+    const path = tempDbPath();
+    try {
+      const workerA = new SqliteEventStore({ path });
+      const workerB = new SqliteEventStore({ path });
+      workerA.append(leadCreatedEvent());
+      const key = 'lead.created:crm:rec_1001';
+
+      expect(workerA.tryClaim(key, 'claim-a', 1_000, 1_000)).toBe(true);
+      expect(workerB.tryClaim(key, 'claim-b', 1_001, 1_000)).toBe(false);
+      expect(workerB.tryClaim(key, 'claim-b', 3_000, 1_000)).toBe(true);
+
+      workerA.markProcessed(key);
+      expect(workerA.tryClaim(key, 'claim-a', 3_001, 1_000)).toBe(false);
+      expect(workerB.tryClaim(key, 'claim-b', 3_001, 1_000)).toBe(false);
+
+      workerA.close();
+      workerB.close();
+    } finally {
+      rmSync(join(path, '..'), { recursive: true, force: true });
+    }
+  });
+
+  it('releaseClaim 只释放自己的租约', () => {
+    const path = tempDbPath();
+    try {
+      const store = new SqliteEventStore({ path });
+      store.append(leadCreatedEvent());
+      const key = 'lead.created:crm:rec_1001';
+
+      expect(store.tryClaim(key, 'claim-a', 1_000, 30_000)).toBe(true);
+      store.releaseClaim(key, 'claim-other');
+      expect(store.tryClaim(key, 'claim-b', 1_001, 30_000)).toBe(false);
+      store.releaseClaim(key, 'claim-a');
+      expect(store.tryClaim(key, 'claim-b', 1_002, 30_000)).toBe(true);
+
+      store.close();
+    } finally {
+      rmSync(join(path, '..'), { recursive: true, force: true });
+    }
+  });
+
   it('InMemory 与 Sqlite 对同一序列的 append 结果一致', () => {
     const path = tempDbPath();
     try {

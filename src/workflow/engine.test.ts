@@ -127,16 +127,44 @@ describe('WorkflowEngine', () => {
     expect(workflows.get('wf_lead_follow_up_lead_1')?.status).toBe('failed');
   });
 
-  it('TIMEOUT 未显式分类时按 transient 处理并允许重试', async () => {
+  it('TIMEOUT 未显式 submitted 时按 transient 记录，但提交状态未知，拒绝简单自动重试', async () => {
     const { engine, workflows, executor } = createEngine();
     executor.failNext(Object.assign(new Error('provider timeout'), { code: 'TIMEOUT' }));
     await engine.handleEvent(leadCreatedEvent({ payload: { ...leadCreatedEvent().payload, contact_id: 'contact_1' } }));
     await engine.handleEvent(leadAssignedEvent());
 
-    expect(workflows.get('wf_lead_follow_up_lead_1')?.status).toBe('failed');
+    expect(workflows.get('wf_lead_follow_up_lead_1')).toMatchObject({
+      status: 'failed',
+      failure_classification: 'transient',
+      failure_submitted: 'unknown',
+    });
+    await expect(engine.retry('wf_lead_follow_up_lead_1')).rejects.toThrow('提交状态未知');
+    expect(executor.attempts()).toHaveLength(1);
+  });
+
+  it('显式 submitted=false 的 transient 失败允许自动重试', async () => {
+    const { engine, workflows, executor } = createEngine();
+    executor.failNext(
+      Object.assign(new Error('provider unavailable'), {
+        classification: 'transient' as const,
+        submitted: false as const,
+      }),
+    );
+    await engine.handleEvent(leadCreatedEvent({ payload: { ...leadCreatedEvent().payload, contact_id: 'contact_1' } }));
+    await engine.handleEvent(leadAssignedEvent());
+
+    expect(workflows.get('wf_lead_follow_up_lead_1')).toMatchObject({
+      status: 'failed',
+      failure_classification: 'transient',
+      failure_submitted: false,
+    });
     await engine.retry('wf_lead_follow_up_lead_1');
-    expect(workflows.get('wf_lead_follow_up_lead_1')?.status).toBe('waiting_result');
     expect(executor.attempts()).toHaveLength(2);
+    expect(workflows.get('wf_lead_follow_up_lead_1')).toMatchObject({
+      status: 'waiting_result',
+      failure_classification: null,
+      failure_submitted: null,
+    });
   });
 
   it('已取消的 Workflow 属于终态：后续结果事件只进入异常队列，不恢复流程', async () => {

@@ -149,6 +149,18 @@ export interface WorkflowInstanceState {
   plan_version: number;
   /** 最近一次处理的事件标识。 */
   last_processed_event_id: string | null;
+  /**
+   * 最近一次 Executor 失败分类。与 `failure_submitted` 一起持久化到 Workflow，
+   * 使重启后仍能判断是否允许自动 retry（transient 可重试，permanent 不可）。
+   */
+  failure_classification: 'transient' | 'permanent' | null;
+  /**
+   * 最近一次失败时动作是否可能已被外部接受：
+   * false = 确认未提交可安全重试；'unknown' = 需 provider 对账，禁止简单 retry。
+   */
+  failure_submitted: boolean | 'unknown' | null;
+  /** 失败建议的最早可重试时间（ISO-8601），无则为 null。 */
+  failure_retry_after: string | null;
   created_at: string;
   updated_at: string;
 }

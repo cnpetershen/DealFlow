@@ -153,16 +153,23 @@ Executor 失败必须在错误边界统一分类，保证调用方可以区分�
 classification:
   transient   # 可自动重试
   permanent   # 需人工介入或修正输入
+submitted:
+  false       # 确认未提交，可安全重试
+  true        # 已提交（通常伴随成功或结果事件）
+  unknown     # 超时/网络中断等无法判定，禁止简单 retry，必须先 provider 对账
+code / provider / provider_reference / retry_after:
+  生产排障字段，可空
 ```
 
 规则：
 
 1. 显式携带 `classification` 的错误原样保留。
-2. `code === 'TIMEOUT'` 默认归类为 `transient`。
-3. 其余未分类错误默认 `permanent`（保守策略，避免盲目重试未知失败）。
-4. `ExecutionError` 至少包含：`actionId`、`message`、`classification`、`cause`。
-5. 后续生产契约将扩展：`code`、`provider`、`provider_reference`、`retry_after`、`submitted`（是否可能已被提供商接受）；`submitted === 'unknown'` 时禁止简单 retry，必须先做 provider 对账。
-6. Workflow 对 `transient` 失败进入 `failed` 并允许 `retry`；对 `permanent` 失败同样进入 `failed`，但 `retry` 抛错拒绝自动重试。
+2. `code === 'TIMEOUT'` 默认归类为 `transient`，且 `submitted` 默认 `'unknown'`（可能已被提供商接受）。
+3. 其余未分类错误默认 `permanent`（保守策略，避免盲目重试未知失败）；未显式提供时 `submitted` 默认 `false`。
+4. `ExecutionError` 至少包含：`actionId`、`message`、`classification`、`cause`，以及生产字段 `code`、`provider`、`provider_reference`、`retry_after`、`submitted`。
+5. `submitted === 'unknown'` 时禁止简单 retry，必须先做 provider 对账后再恢复自动重试。
+6. Workflow 对 `transient` 且 `submitted !== 'unknown'` 的失败进入 `failed` 并允许 `retry`；对 `permanent` 或 `submitted === 'unknown'` 的失败进入 `failed` 后 `retry` 抛错拒绝。失败分类与 `submitted` 持久化在 WorkflowInstanceState 的 `failure_*` 字段，进程重启后仍生效。
+7. 成功派发后必须清空 `failure_classification` / `failure_submitted` / `failure_retry_after`。
 
 ## Result Event Contract
 

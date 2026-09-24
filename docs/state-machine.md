@@ -64,8 +64,9 @@
 | Workflow `needs_review` | 人工拒绝 | ProposedAction 被拒绝 | `replanning` | 记录拒绝原因，基于新约束重新规划 |
 | Workflow `replanning` | 规划完成 | 已生成新的 `plan_version`，或确认无安全替代动作 | `running` / `waiting_result` / `needs_review` | 进入新计划的首个可执行步骤，或转为等待、人工审核 |
 | Workflow `replanning` | 流程结束 | 无后续步骤且无待办 | `completed` | 结束自动动作，写入审计记录 |
-| Workflow `failed` | 重试 | 重试策略允许（仅 `transient` 失败） | `running` | 复用同一 `idempotency_key` 重试 |
+| Workflow `failed` | 重试 | `transient` 且 `submitted !== 'unknown'` | `running` | 复用同一 `idempotency_key` 重试 |
 | Workflow `failed` | 重试 | `permanent` 失败 | 保持 `failed` | 拒绝自动重试，需人工处理或修正输入 |
+| Workflow `failed` | 重试 | `submitted === 'unknown'`（可能已提交） | 保持 `failed` | 拒绝简单自动重试，先做 provider 对账 |
 | Workflow 任意非终态 | 取消操作 | 明确取消 | `cancelled` | 不再自动执行未批准动作 |
 
 表中的 Lead 和 Deal 状态必须通过受控的事件处理更新。没有对应事件或违反阶段规则的状态写入应被拒绝并进入异常处理。
@@ -81,7 +82,7 @@ Workflow 的触发器与 Lead/Deal 不同：它既可以是外部事件（例如
 5. **结果优先于计划**：外部结果事件到达后，先更新当前事实并标记旧等待节点完成，再进入 `replanning`。
 6. **计划版本递增**：每次重新规划生成新的 `plan_version`。旧计划的未执行动作不得自动复用，除非新计划明确确认仍然有效。
 7. **迟到和冲突事件**：依据实体版本和阶段迁移规则处理。不能安全合并的事件必须保留并转 `needs_review`，不可静默覆盖当前事实。
-8. **失败可重试**：事件已落库但处理失败时，重试必须复用同一个 `idempotency_key`，不能产生第二次业务效果。失败分类为 `transient`（含 TIMEOUT）时允许自动重试；分类为 `permanent` 时 `retry` 必须拒绝。失败分类与审计关系见 `docs/domain.md`「Executor Error Contract」与「Audit 契约」。
+8. **失败可重试**：事件已落库但处理失败时，重试必须复用同一个 `idempotency_key`，不能产生第二次业务效果。失败分类与 `submitted` 写入 WorkflowInstanceState 的 `failure_classification` / `failure_submitted` / `failure_retry_after`，重启后仍生效。`transient` 且 `submitted !== 'unknown'` 时允许自动重试；`permanent` 或 `submitted === 'unknown'` 时 `retry` 必须拒绝。见 `docs/domain.md`「Executor Error Contract」与「Audit 契约」。
 9. **终态保护**：Lead 已 `disqualified`/`closed` 或 Deal 已 `won`/`lost` 后，默认不再自动恢复原 Workflow；新事实只能产生明确的后续流程或人工审核。
 10. **审计先行**：状态迁移、Decision、Policy 结论、人工操作和执行结果均追加 Audit Log，Audit Log 不可修改。
-11. **崩溃恢复重放**：EventStore 中的事件是恢复的唯一事实来源。重启后对空 State Store 调用 `recoverFromEventLog()`，按 `sequence` 重放全部事件重建 State；`pending` 事件完整处理并 `markProcessed`，已处理事件幂等重放。事件仍为 `pending` 且 Workflow 已是 `failed` 时，重投事件按 `retry` 语义先恢复 `running` 再规划。
+11. **崩溃恢复重放**：EventStore 中的事件是恢复的唯一事实来源。重启后对空 State Store 调用 `recoverFromEventLog()`，按 `sequence` 重放全部事件重建 State；`pending` 事件完整处理并 `markProcessed`，已处理事件幂等重放。事件仍为 `pending` 且 Workflow 已是 `failed` 时，重投事件按 `retry` 语义先恢复 `running` 再规划。多 worker 并发时通过事件处理租约（claim lease）保证同一 `idempotency_key` 同一时刻仅一个 worker 处理。

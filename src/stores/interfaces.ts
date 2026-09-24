@@ -48,6 +48,24 @@ export interface EventStore {
   list(): readonly StoredEvent[];
 }
 
+/**
+ * 可选的跨进程处理租约：防止多个 worker 同时处理同一 pending 事件。
+ * 基本 EventStore 不要求实现；支持持久化/多进程的实现应提供。
+ */
+export interface ClaimableEventStore extends EventStore {
+  /** 尝试获取处理租约；已 processed、不存在或租约被他人持有且未过期时返回 false。 */
+  tryClaim(idempotencyKey: string, claimId: string, nowMs: number, leaseMs: number): boolean;
+  /** 释放自己的租约；他人的租约不受影响。 */
+  releaseClaim(idempotencyKey: string, claimId: string): void;
+}
+
+export function isClaimableEventStore(store: EventStore): store is ClaimableEventStore {
+  return (
+    typeof (store as Partial<ClaimableEventStore>).tryClaim === 'function' &&
+    typeof (store as Partial<ClaimableEventStore>).releaseClaim === 'function'
+  );
+}
+
 /** Audit Log 只追加，不可修改。 */
 export interface AuditLogStore {
   append(entry: NewAuditEntry): AuditEntry;
