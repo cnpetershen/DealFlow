@@ -13,7 +13,7 @@ import {
   ExceptionNotFoundError,
   WorkflowBusinessKeyConflictError,
 } from './interfaces';
-import { canonicalStringify, deepFreezeClone } from './shared';
+import { deepFreezeClone, describesSameFact } from './shared';
 import type {
   AuditEntry,
   ExceptionRecord,
@@ -22,15 +22,6 @@ import type {
   WorkflowInstanceState,
 } from './types';
 import { workflowBusinessKey } from './types';
-
-/** 同一 idempotency_key 是否描述同一事实：类型、版本、payload 都必须一致。 */
-function describesSameFact(left: ParsedEvent, right: ParsedEvent): boolean {
-  return (
-    left.type === right.type &&
-    left.version === right.version &&
-    canonicalStringify(left.payload) === canonicalStringify(right.payload)
-  );
-}
 
 export class InMemoryEventStore implements EventStore {
   readonly #byIdempotencyKey = new Map<string, StoredEvent>();

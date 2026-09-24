@@ -47,3 +47,18 @@ export function canonicalStringify(value: unknown): string {
     .map(([key, entryValue]) => `${JSON.stringify(key)}:${canonicalStringify(entryValue)}`)
     .join(',')}}`;
 }
+
+/**
+ * 同一 idempotency_key 是否描述同一事实：类型、版本、payload 都必须一致。
+ * InMemory 与持久化 EventStore 共用，保证幂等语义一致。
+ */
+export function describesSameFact(
+  left: { type: string; version: number; payload: unknown },
+  right: { type: string; version: number; payload: unknown },
+): boolean {
+  return (
+    left.type === right.type &&
+    left.version === right.version &&
+    canonicalStringify(left.payload) === canonicalStringify(right.payload)
+  );
+}
