@@ -126,7 +126,7 @@ AuditEntry 必须包含：
 - `audit_id`：审计记录的唯一标识
 - `occurred_at`：审计动作发生时间，使用带时区的时间
 - `actor`：主体，包含 `actor_type`（`system` / `user` / `connector`）和 `actor_id`
-- `action`：审计动作类型，例如 `event_processed`、`state_transitioned`、`decision_proposed`、`policy_evaluated`、`policy_rejected`、`action_approved`、`action_rejected`、`action_dispatched`、`action_failed`、`action_reconciled`、`event_conflicted`、`exception_enqueued`、`exception_resolved`、`exception_discarded`、`exception_replayed`
+- `action`：审计动作类型，例如 `event_processed`、`state_transitioned`、`decision_proposed`、`policy_evaluated`、`policy_rejected`、`action_approved`、`action_rejected`、`action_stale`、`replan_requested`、`action_dispatched`、`action_failed`、`action_reconciled`、`event_conflicted`、`exception_enqueued`、`exception_resolved`、`exception_discarded`、`exception_replayed`
 - `subject`：关联实体，包含 `subject_type`、`subject_id`，以及可空的 `workflow_instance_id`
 - `event_id` / `action_id`：本记录关联的原始事件或 ProposedAction 标识；异常处理结论通过 `exception_id` 关联，两者至少一个不为空
 - `action_type`：关联动作的类型，可空。单独保存是因为重启后内存中的动作表会丢失，审计仍需能回答「派发了什么动作」，也用于「逾期任务是否已被补救」这类派生判断
@@ -150,21 +150,22 @@ AuditEntry 不参与状态计算。当前事实以 State 为准，AuditEntry 只
 | Action（决策） | `decision_proposed` | `event_id` + `action_id` | Decision 提出 ProposedAction |
 | Action（策略） | `policy_evaluated` / `policy_rejected` | `event_id` + `action_id` | Policy 结论：auto / human_review / reject |
 | Action（审批） | `action_approved` / `action_rejected` | `action_id` | 控制面人工操作，`event_id` 可为空 |
+| Action（失效重规划） | `action_stale` / `replan_requested` | `action_id` | 批准前复核发现动作已失效，或人工要求重新规划：动作作废、按当前 State 重算，`result = skipped` |
 | 状态迁移 | `state_transitioned` | `subject.workflow_instance_id` | Workflow 自身状态变化（进入等待、结束），含 `before_state` / `after_state` |
 | Execution（派发） | `action_dispatched` | `event_id` + `action_id` | Executor 已接受动作，`result = succeeded`，并写入 `provider_receipt` |
 | Execution（失败） | `action_failed` | `event_id` + `action_id` | Executor 拒绝或抛错，`result = failed`，`reason` 前缀为 `transient:` 或 `permanent:` |
 | Execution（对账） | `action_reconciled` | `action_id` | `submitted === 'unknown'` 的对账结论：已提交 / 未提交 / 无法判定，写入 `provider_receipt` |
-| Result（结果事件） | `event_processed` | `event_id` | 匹配的结果事件已消费；携带 `provider_reference` 时写入该字段 |
+| Result（结果事件） | `event_processed` | `event_id` | 匹配的结果事件已消费；`needs_review` 期间到达并被合并的事实、以及终态实例上到达的非事实类事件，同样按 `processed` 消费、写入本条；携带 `provider_reference` 时写入该字段 |
 | Error / Retry | `action_failed` + 后续 `decision_proposed` | `action_id` | 失败分类决定是否允许 `retry`；重试成功后产生新的 `action_dispatched` |
 | Conflict | `event_conflicted` | `event_id` | 同一 `idempotency_key` 携带不同事实，拒绝覆盖并写入异常队列 |
-| Exception | `exception_enqueued` + 异常队列记录（非 AuditEntry 本体） | `event_id` + `exception_id` | 每次写入异常队列都追加一条审计；异常原因见「异常队列」 |
+| Exception | `exception_enqueued` + 异常队列记录（非 AuditEntry 本体） | `event_id` + `exception_id` | 每次写入异常队列都追加一条审计；异常原因见「异常队列」。`awaiting_approval` 与 `workflow_ended` 因事件已正常消费，审计记 `result = pending`，其余原因记 `failed` |
 | Exception（结论） | `exception_resolved` / `exception_discarded` / `exception_replayed` | `exception_id` + `event_id` | 人工结论与重放：记录操作者、结论原因、前后状态；结论本体保存在异常记录上 |
 
 规则：
 
 1. 每个 ProposedAction 至少有一条 `decision_proposed`；被 Policy 拒绝时有 `policy_rejected`，不再有 `action_dispatched`。
 2. 每次 Executor 调用结束（成功或失败）必须有对应的 `action_dispatched` 或 `action_failed`。
-3. 结果事件匹配成功时必须有 `event_processed`，并保留该事件 payload 中的 `provider_reference`。
+3. 结果事件匹配成功、或在 `needs_review` 期间被合并消费时必须有 `event_processed`，并保留该事件 payload 中的 `provider_reference`。
 4. permanent 失败的 Workflow 不允许自动 `retry`；transient 失败允许，且重试必须复用原事件与执行幂等 key。
 5. Exception 写入不修改原始事件；原始事件与已有 AuditEntry 保持不可变。
 6. `submitted === 'unknown'` 的失败必须先 `action_reconciled` 得出结论，才能回到 `retry` 或 `waiting_result`。
@@ -226,13 +227,16 @@ correlation_id: string | null       # 提供商关联 id，可与 action 对账
 - 同一 `idempotency_key` 携带不同 payload（幂等冲突）
 - 事件不匹配任何等待条件，且不能安全地作为新事实合并
 - 迟到事件与当前 State 版本冲突，无法确定优先级
+- 事件在 `needs_review` 期间到达：事实已合并、事件已按 `processed` 消费，但流程在等人工审批
+- 事件到达时实例已进入终态（`completed` / `cancelled`）：事实已合并、事件已按 `processed` 消费，
+  但流程不再推进，需要人工判断是否新建后续流程（原因 `workflow_ended`）
 - 处理过程中发生不可自动恢复的错误
 
 每个异常记录必须包含：
 
 - `exception_id`
 - `occurred_at`
-- `reason`：归类原因，例如 `idempotency_conflict`、`unmatched_event`、`stale_event`、`invalid_transition`、`processing_error`
+- `reason`：归类原因，例如 `idempotency_conflict`、`unmatched_event`、`stale_event`、`invalid_transition`、`awaiting_approval`、`workflow_ended`、`processing_error`
 - `event_id` 与事件的完整信封副本。两者都可为 `null`：异常也可能由控制面操作产生
   （例如 Provider 对账返回 `unknown`），那种情况没有触发事件，用 `subject` 与关联审计的 `action_id` 定位
 - `subject`：关联实体标识，可为空
@@ -249,6 +253,10 @@ correlation_id: string | null       # 提供商关联 id，可与 action 对账
 | `resolve` | 人工给出结论，异常关闭 | 事件保持原处理状态 |
 | `discard` | 明确判定该输入不应产生任何业务效果 | 不允许重放（`409`） |
 | `replay` | 把异常记录里的**事件副本**重新交给正常 Workflow 路径 | 走 `handleEvent`，按 `idempotency_key` 去重 |
+
+`awaiting_approval` 是唯一由流程自身关闭的异常：实例离开 `needs_review`（approve / reject / replan / cancel）时
+自动 `resolve`，结论固定为「审批已离开 needs_review」，`resolved_by` 取审批操作者；其余原因都必须由人工
+`resolve` / `discard` / `replay` 给出结论。实例仍停在 `needs_review` 时该异常保持 `open`——它还描述着真实待办。
 
 `replay` 的约束（实现见 `WorkflowEngine.replayException`）：
 

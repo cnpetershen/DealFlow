@@ -593,6 +593,8 @@ export function createApplication(options: CreateApplicationOptions = {}): Appli
     audit_log: audit,
     exception_queue: exceptions,
     pending_action_store: pendingActions,
+    lead_store: leads,
+    deal_store: deals,
     config,
     metrics,
     logger,

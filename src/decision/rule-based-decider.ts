@@ -7,7 +7,7 @@ import {
   type WorkflowStatus,
 } from '../state-machine/states';
 import { deepFreezeClone } from '../stores/shared';
-import type { DecisionContext } from './context';
+import type { DecisionContext, PreviousDecision } from './context';
 import type { Decider } from './interfaces';
 import { ACTION_METADATA, type ActionType, type ProposedAction, type ProposedActionDraft } from './types';
 
@@ -18,7 +18,8 @@ import { ACTION_METADATA, type ActionType, type ProposedAction, type ProposedAct
  * - 只基于 Context 中已有的事实产出建议，任何不确定的输入都导致「不提出动作」，
  *   而不是猜一个默认值；缺少参数时留给人工或后续事件。
  * - 相同 Context 产出相同建议，便于审计与复现（`action_id` 由注入的生成器决定）。
- * - 已被人工拒绝的动作类型不再重复提出，拒绝原因作为新的规划约束生效。
+ * - 已被人工拒绝的动作类型在「同一上下文」内不再重复提出；新事件进入后可以重新提出，
+ *   但必须再次人工审核，拒绝原因作为新的规划约束生效。
  */
 
 /** 允许提出动作的 Workflow 状态；等待结果或待审核时不重复规划。 */
@@ -55,17 +56,45 @@ export class RuleBasedDecider implements Decider {
       return [];
     }
 
-    const rejectedActionTypes = new Set(
-      context.previous_decisions
-        .filter((decision) => decision.status === 'rejected')
-        .map((decision) => decision.action_type),
-    );
+    /**
+     * 人工拒绝是规划约束，但不是永久拉黑：
+     * - 拒绝所依据的事件还是最后一条事件（同一上下文）→ 阻断，避免拒绝后立刻原样重提；
+     * - 有更新的事件进入 → 可以重新提出，但必须再次人工审核，绕过审批自动执行等于无视上一次拒绝。
+     * 同一动作类型被反复拒绝时以最后一次为准。
+     */
+    const lastEventId = context.workflow_instance.last_processed_event_id;
+    const latestByType = new Map<ActionType, PreviousDecision>();
+    for (const decision of context.previous_decisions) {
+      if (decision.status === 'rejected') {
+        latestByType.set(decision.action_type, decision);
+      }
+    }
+
+    const blockedTypes = new Set<ActionType>();
+    const needsApprovalTypes = new Set<ActionType>();
+    for (const [actionType, decision] of latestByType) {
+      if (decision.basis_event_id !== undefined && decision.basis_event_id === lastEventId) {
+        blockedTypes.add(actionType);
+      } else {
+        needsApprovalTypes.add(actionType);
+      }
+    }
 
     for (const rule of DECISION_RULES) {
-      const drafts = rule(context).filter((draft) => !rejectedActionTypes.has(draft.action_type));
+      const drafts = rule(context).filter((draft) => !blockedTypes.has(draft.action_type));
 
       if (drafts.length > 0) {
-        return drafts.map((draft) => this.#materialize(draft));
+        return drafts.map((draft) =>
+          this.#materialize(
+            needsApprovalTypes.has(draft.action_type)
+              ? {
+                  ...draft,
+                  requires_approval: true,
+                  reason: `${draft.reason}（该动作此前被人工拒绝，需再次审批）`,
+                }
+              : draft,
+          ),
+        );
       }
     }
 

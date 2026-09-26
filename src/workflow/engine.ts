@@ -142,6 +142,17 @@ export interface ReconcileResult {
   readonly exception_id?: string;
 }
 
+/**
+ * 人工审核结论（approve / reject 共用）。
+ *
+ * `stale_action_replanned` 为 true 表示审核时动作已经失效：引擎没有执行它，
+ * 而是作废该动作并基于当前事实重新规划，实例因此离开 needs_review。
+ */
+export interface ReviewOutcome {
+  readonly workflow: WorkflowInstanceState;
+  readonly stale_action_replanned: boolean;
+}
+
 /** 人工处理异常时的结论与操作者。 */
 export interface ExceptionDecision {
   readonly resolution: string;
@@ -482,18 +493,42 @@ export class WorkflowEngine {
     return this.#dispatchAction(planned.action, planned.workflow, entry.event, false);
   }
 
-  approve(id: string, actionId: string, actorId: string): Promise<WorkflowInstanceState> {
-    return this.#review(id, actionId, actorId, true, null);
+  async approve(id: string, actionId: string, actorId: string): Promise<ReviewOutcome> {
+    const outcome = await this.#review(id, actionId, actorId, true, null);
+    this.#settleAwaitingApproval(outcome.workflow, actorId);
+    return outcome;
   }
 
-  reject(id: string, actionId: string, actorId: string, reason: string): Promise<WorkflowInstanceState> {
-    return this.#review(id, actionId, actorId, false, reason);
+  async reject(id: string, actionId: string, actorId: string, reason: string): Promise<ReviewOutcome> {
+    const outcome = await this.#review(id, actionId, actorId, false, reason);
+    this.#settleAwaitingApproval(outcome.workflow, actorId);
+    return outcome;
+  }
+
+  /**
+   * 人工重新规划：作废当前待审动作并按当前事实重算下一步。
+   *
+   * 与「拒绝」的区别是不写 `previous_decisions`——重新规划只是丢掉过时的计划，
+   * 不等于人工否决这个动作类型，否则重新规划一次就等于永久拉黑一次。
+   */
+  async replan(id: string, actorId: string): Promise<WorkflowInstanceState> {
+    const w = this.#require(id);
+    if (w.status !== 'needs_review') {
+      throw new BusinessError(`只有待审核实例可以重新规划，当前状态 ${w.status}`);
+    }
+
+    const action = this.#pendingActions.getPending(id)?.action ?? null;
+    const next = await this.#staleActionReplan(w, action, actorId, 'replan_requested', `人工触发重新规划（${actorId}）`);
+    this.#settleAwaitingApproval(next, actorId);
+    return next;
   }
 
   cancel(id: string, actorId = 'system'): WorkflowInstanceState {
-    return this.#transaction(() =>
+    const next = this.#transaction(() =>
       this.#transitionWithAudit(this.#require(id), 'cancel_requested', undefined, `cancelled by ${actorId}`, actorId),
     );
+    this.#settleAwaitingApproval(next, actorId);
+    return next;
   }
 
   /**
@@ -756,6 +791,43 @@ export class WorkflowEngine {
     });
   }
 
+  /**
+   * 实例离开 `needs_review` 后，等待审批期间入队的 `awaiting_approval` 异常已无人需要处理：
+   * 审批、拒绝、重新规划或取消本身就是对那段事实的人工判断，留着 open 只会让异常队列
+   * 堆满已完成事项。仍停在 `needs_review` 的实例不动——此时异常还描述着真实待办。
+   */
+  #settleAwaitingApproval(w: WorkflowInstanceState, actor: string): void {
+    if (w.status === 'needs_review') {
+      return;
+    }
+    const open = this.#o.exception_queue.listOpen().filter(
+      (record) => record.reason === 'awaiting_approval'
+        && record.subject?.workflow_instance_id === w.workflow_instance_id,
+    );
+    if (open.length === 0) {
+      return;
+    }
+    this.#transaction(() => {
+      for (const record of open) {
+        const before = record.status;
+        const settled = this.#o.exception_queue.resolve(
+          record.exception_id,
+          '审批已离开 needs_review：等待期间到达的事实已并入规划输入',
+          actor,
+          this.#now(),
+        );
+        this.#auditException(
+          'exception_resolved',
+          settled,
+          actor,
+          '等待人工审批期间入队的事件已随审批一并处理',
+          'succeeded',
+          before,
+        );
+      }
+    });
+  }
+
   async #process(e: ParsedEvent, replay: boolean): Promise<{ workflow: WorkflowInstanceState | null; failed: boolean }> {
     if (e.type === 'lead.created') {
       const workflow = this.#transaction(() => {
@@ -799,6 +871,9 @@ export class WorkflowEngine {
      * - 推导等待（`current_step === 'await_event'`）且事件命中等待集合：等待被满足，可以重新规划；
      * - 派发动作后的等待集合只包含该动作的结果事件，事实类事件不会命中它，
      *   因此在动作在途、以及等待人工审核期间，不会重复规划、重复派发。
+     *
+     * 「推导等待 + 事实合并后 Decider 输入发生变化」这条额外唤醒规则在下方 `#mergeAndPlan`
+     * 内判断，因为它必须比较合并前后的真实 State（例如联系人邮箱是分配之后才登记的）。
      */
     const factOnlyReplans =
       factOnly &&
@@ -825,8 +900,18 @@ export class WorkflowEngine {
         this.#facts(e);
         return this.#commitFactOnly(w, e);
       }
-      this.#unmatched(e, w);
-      return null;
+      /**
+       * 终态实例不恢复流程（docs/state-machine.md「Workflow Resume 规则」第 9 条），
+       * 但事件确实发生在该主体上：它不是「无人认领」，不能记 `unmatched_event`，
+       * 也不能让事件永远停在 `pending`——重放只会走到同一条分支得到同样结论。
+       * 这里按事实落库并按 `processed` 消费事件，用 `workflow_ended` 进异常队列交人工
+       * 判断是否需要新建后续流程；Workflow 自身保持终态不变。事实本身非法时仍由
+       * `#facts` 抛错走 catch，原因保持 `invalid_transition` / `stale_event`。
+       */
+      this.#facts(e);
+      const merged = this.#commitFactOnly(w, e);
+      this.#enqueueException('workflow_ended', e, merged.workflow, undefined, 'pending');
+      return merged;
     }
 
     if (w.status === 'waiting_result' && !this.#matches(w, e) && !factOnly) {
@@ -839,24 +924,39 @@ export class WorkflowEngine {
      *
      * `needs_review` 没有可用的迁移触发器，因此不能推进流程；但「事件已经发生」是事实，
      * 不该因为审核没走完就整笔回滚丢掉。这里在**独立事务**中合并可安全合并的事实，
-     * 再把事件放进异常队列等人工判断：既不静默覆盖、也不静默丢弃。
+     * 并把事件按 `processed` 消费掉（事实已落库、审计可查），再用 `awaiting_approval`
+     * 写进异常队列等人工判断：既不静默覆盖、也不静默丢弃，也不把「等审批」误报成处理失败。
+     * 真正非法的事实冲突由 `#facts` 抛错，走上面 catch 返回 failed，原因保持 stale_event。
      */
     if (w.status === 'needs_review' && !factOnly) {
       this.#facts(e);
       const merged = this.#save({ ...w, last_processed_event_id: e.event_id, updated_at: this.#now() });
-      this.#enqueueException('invalid_transition', e, merged);
+      this.#audit(e, merged, 'event_processed', null, null, 'succeeded');
+      this.#enqueueException('awaiting_approval', e, merged, undefined, 'pending');
       this.#o.event_store.markProcessed(e.idempotency_key);
-      return { workflow: merged, action: null, failed: true };
+      return { workflow: merged, action: null, failed: false };
     }
 
-    if (factOnly && !factOnlyReplans) {
-      // 事实类事件只合并事实：不消费等待条件、不改状态、不重新规划。
-      // 这样在「等待人工审核」或「等待外部结果」期间，Deal / Contact 的新事实也不会被丢弃。
+    if (factOnly) {
+      const before = this.#decisionFacts(w);
       this.#facts(e);
-      return this.#commitFactOnly(w, e);
-    }
 
-    this.#facts(e);
+      /**
+       * 派生等待（没有任何动作在途，只是按 State 推导出的集合休眠）时，
+       * 事实合并若真的改变了 Decider 的输入就必须重新规划：否则流程会一直等一个
+       * 永远不会来的事件——典型是「分配时还没有邮箱，之后才登记 contact.recorded」，
+       * 系统会空等一封从未派发的 email.sent。
+       * 动作在途（current_step = 动作类型）与 waiting for 人工审核都不在此列，
+       * 因此不会重复派发、也不会绕过审批。
+       */
+      const waking =
+        factOnlyReplans || (this.#awaitingDerivedEvents(w) && before !== this.#decisionFacts(w));
+      if (!waking) {
+        return this.#commitFactOnly(w, e);
+      }
+    } else {
+      this.#facts(e);
+    }
 
     let current: WorkflowInstanceState = {
       ...w,
@@ -878,6 +978,41 @@ export class WorkflowEngine {
       this.#o.event_store.markProcessed(e.idempotency_key);
     }
     return planned;
+  }
+
+  /**
+   * 派生等待：流程按当前 State 推导出的等待集合休眠，没有任何动作在途。
+   * 与之相对的是「动作已派发、只等该动作的结果事件」（current_step = 动作类型），
+   * 后者期间到达的事实不能触发规划，否则会重复派发或绕过审批。
+   */
+  #awaitingDerivedEvents(w: WorkflowInstanceState): boolean {
+    return w.status === 'waiting_result' && w.current_step === 'await_event';
+  }
+
+  /**
+   * Decision 关心的事实摘要，用于判断一次事实合并是否真的改变了规划输入。
+   * 只取 Decider / Policy 读取的字段：其余变化（如 full_name）不值得让 plan_version 抖动。
+   */
+  #decisionFacts(w: WorkflowInstanceState): string {
+    const lead = this.#o.lead_store.get(w.subject_id) ?? null;
+    const contact = lead?.contact_id === null || lead?.contact_id === undefined
+      ? null
+      : this.#o.contact_store.get(lead.contact_id) ?? null;
+    const deal = this.#o.deal_store.listByLeadId(w.subject_id)[0] ?? null;
+
+    return JSON.stringify({
+      lead: lead === null ? null : { status: lead.status, owner_id: lead.owner_id, contact_id: lead.contact_id },
+      contact:
+        contact === null
+          ? null
+          : {
+              email: contact.email,
+              contactability: contact.contactability,
+              contact_preference: contact.contact_preference,
+              is_new_contact: contact.is_new_contact,
+            },
+      deal: deal === null ? null : { stage: deal.stage, amount: deal.amount },
+    });
   }
 
   /** 只合并事实的事件处理收尾：登记处理结果、写审计，不改变 Workflow 状态。 */
@@ -1118,6 +1253,9 @@ export class WorkflowEngine {
       );
 
       if (outcome.decision === 'reject') {
+        // Policy 拒绝也是「已决」：记录停在 pending 会让控制面显示一个永远批不掉的待审动作，
+        // 而它和人工拒绝的区别由 decision='policy_rejected' + 审计 action='policy_rejected' 表达。
+        this.#markActionDecided(action, 'policy_rejected', 'policy');
         continue;
       }
       if (outcome.decision === 'human_review') {
@@ -1251,7 +1389,11 @@ export class WorkflowEngine {
   }
 
   /** 把待审批记录置为已决；不存在（如自动执行路径）时忽略。 */
-  #markActionDecided(action: ProposedAction, decision: 'approved' | 'rejected' | null, actor: string | null): void {
+  #markActionDecided(
+    action: ProposedAction,
+    decision: 'approved' | 'rejected' | 'policy_rejected' | null,
+    actor: string | null,
+  ): void {
     const record = this.#pendingActions.get(action.action_id);
     if (record === undefined || record.status === 'decided') {
       return;
@@ -1288,7 +1430,7 @@ export class WorkflowEngine {
     actor: string,
     approved: boolean,
     why: string | null,
-  ): Promise<WorkflowInstanceState> {
+  ): Promise<ReviewOutcome> {
     const w = this.#require(id);
     const record = this.#pendingActions.get(actionId);
     const action = record?.action ?? null;
@@ -1301,11 +1443,17 @@ export class WorkflowEngine {
      * 批准前必须重新读取当前 State，确认动作未过期、未被新事件取代、plan_version 仍有效。
      * 否则人工可能批准一个已经失效的动作（例如 Deal 已 won、联系人已退订、动作已过期），
      * 而审批入口是控制面开放的，不能假设审核人一定看得到最新事实。
+     *
+     * 失效不能靠抛错来处理：那会让实例永远停在 needs_review，除了 cancel 没有别的推进手段。
+     * 正确出口是作废该动作并按当前事实重新规划，把决定权交回 Decider。
      */
     if (approved) {
       const outcome = this.#o.policy.evaluate(action, this.#context(w, this.#now()));
       if (outcome.decision === 'reject') {
-        throw new BusinessError(`待审核动作已失效，拒绝执行: ${reason(outcome)}`);
+        return {
+          workflow: await this.#staleActionReplan(w, action, actor, 'action_stale', reason(outcome)),
+          stale_action_replanned: true,
+        };
       }
     }
 
@@ -1322,6 +1470,9 @@ export class WorkflowEngine {
       /**
        * 拒绝结论写进 State 而不是进程内存：已拒动作是新的规划约束，
        * 只存内存会在重启后立刻失效，同一动作会被 Decider 原样重新提出，等于人工白拒一次。
+       *
+       * `basis_event_id` 锚定约束的有效期：同一条事件还在处理位上时阻断重提（防止拒绝后立刻拉锯），
+       * 新事件进入后解封，但 Decider 会强制该动作 `requires_approval`，不会绕过这次人工拒绝自动执行。
        */
       const rejection: PreviousDecision | null = approved
         ? null
@@ -1333,6 +1484,7 @@ export class WorkflowEngine {
             decided_by: actor,
             reason: why,
             decided_at: this.#now(),
+            basis_event_id: w.last_processed_event_id,
           };
 
       const base = this.#transition(w, approved ? 'approval_granted' : 'approval_rejected');
@@ -1347,12 +1499,45 @@ export class WorkflowEngine {
     if (!approved) {
       const planned = this.#transaction(() => this.#planSync(next, null));
       if (planned.action === null) {
-        return planned.workflow;
+        return { workflow: planned.workflow, stale_action_replanned: false };
       }
-      return this.#dispatchAction(planned.action, planned.workflow, null, false);
+      return {
+        workflow: await this.#dispatchAction(planned.action, planned.workflow, null, false),
+        stale_action_replanned: false,
+      };
     }
 
-    return this.#dispatchAction(action, next, null, false);
+    return { workflow: await this.#dispatchAction(action, next, null, false), stale_action_replanned: false };
+  }
+
+  /**
+   * 待审动作失效（被新事实取代 / 人工要求重来）时的统一出口：
+   * 作废该动作，再基于当前 State 重新规划，让实例离开 needs_review。
+   *
+   * 作废不写拒绝结论（decision=null）：被取代只是「计划过时了」，不是否决这个动作类型，
+   * 写进 previous_decisions 会让 Decider 永久避开它，重新规划反而比审批死锁更糟。
+   * 「策略拒发」由 Policy 的 policy_rejected 结论表达，人工拒绝才写 previous_decisions。
+   */
+  async #staleActionReplan(
+    w: WorkflowInstanceState,
+    action: ProposedAction | null,
+    actor: string,
+    auditAction: 'action_stale' | 'replan_requested',
+    reasonText: string,
+  ): Promise<WorkflowInstanceState> {
+    const planned = this.#transaction(() => {
+      if (action !== null) {
+        this.#markActionDecided(action, null, actor);
+      }
+      this.#audit(null, w, auditAction, action, reasonText, 'skipped');
+      // 外部副作用必须留在事务之外，因此这里只把规划做完，派发放到事务提交后。
+      return this.#planSync(this.#save(this.#transition(w, 'stale_action')), null);
+    });
+
+    if (planned.action === null) {
+      return planned.workflow;
+    }
+    return this.#dispatchAction(planned.action, planned.workflow, null, false);
   }
 
   /**
@@ -1584,12 +1769,17 @@ export class WorkflowEngine {
    * 事件保持 pending，重复投递会原样再走到这里，`processing_error` / `idempotency_conflict` /
    * `invalid_transition` 与 `unmatched_event` 一样会被同一条事件按同一原因刷满队列。
    * 没有关联事件（e 为 null）时无从比对，保持每次都入队。
+   *
+   * `auditResult` 表达该异常的严重度：真正没处理成功用 `failed`（默认）；
+   * `awaiting_approval` 这类「事件已正常消费、只是流程在等人」的入队记 `pending`，
+   * 否则监控会把每次等待审批都当成一次处理失败。
    */
   #enqueueException(
     reason: ExceptionReason,
     e: ParsedEvent | null,
     subject: WorkflowInstanceState | null,
     detail?: string,
+    auditResult: NewAuditEntry['result'] = 'failed',
   ): ExceptionRecord {
     if (e !== null) {
       const duplicate = this.#o.exception_queue
@@ -1608,7 +1798,7 @@ export class WorkflowEngine {
       subject: subject ? this.#subject(subject) : null,
     });
     try {
-      this.#audit(e, subject, 'exception_enqueued', null, detail ?? reason, 'failed', null, {
+      this.#audit(e, subject, 'exception_enqueued', null, detail ?? reason, auditResult, null, {
         exception_id: record.exception_id,
       });
     } catch {

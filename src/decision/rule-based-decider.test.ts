@@ -12,7 +12,7 @@ import {
   proposalSentEvent,
   workflowState,
 } from '../testing/fixtures';
-import type { DecisionContext } from './context';
+import type { DecisionContext, PreviousDecision } from './context';
 import { RuleBasedDecider } from './rule-based-decider';
 import { ACTION_METADATA, type ProposedAction } from './types';
 import type { WorkflowInstanceState } from '../stores/types';
@@ -343,40 +343,58 @@ describe('RuleBasedDecider 逾期分支', () => {
 });
 
 describe('RuleBasedDecider 拒绝原因即规划约束', () => {
-  it('不再提出已被人工拒绝的同类动作', () => {
+  const rejection = (basis_event_id: string | null): PreviousDecision => ({
+    action_id: 'action_old',
+    action_type: 'send_email',
+    status: 'rejected',
+    plan_version: 1,
+    decided_by: 'user_9',
+    reason: '改用人工联系',
+    decided_at: '2026-09-24T10:04:00+08:00',
+    basis_event_id,
+  });
+
+  it('拒绝所依据的事件仍是最后一条事件时，不再提出同类动作', () => {
     expect(
       decide(
         decisionContext({
-          previous_decisions: [
-            {
-              action_id: 'action_old',
-              action_type: 'send_email',
-              status: 'rejected',
-              plan_version: 1,
-              decided_by: 'user_9',
-              reason: '改用人工联系',
-              decided_at: '2026-09-24T10:04:00+08:00',
-            },
-          ],
+          workflow_instance: workflowWith({ last_processed_event_id: 'evt_assigned' }),
+          previous_decisions: [rejection('evt_assigned')],
         }),
       ),
     ).toEqual([]);
   });
 
+  it('新事件进入后同一动作可以再次提出，但必须再次人工审核', () => {
+    const action = only(
+      decisionContext({
+        workflow_instance: workflowWith({ last_processed_event_id: 'evt_new_fact' }),
+        previous_decisions: [rejection('evt_assigned')],
+      }),
+    );
+
+    expect(action).toMatchObject({ action_type: 'send_email', requires_approval: true });
+    expect(action.reason).toContain('此前被人工拒绝');
+  });
+
+  it('缺少 basis_event_id 的历史拒绝记录不再永久阻断，但必须再次人工审核', () => {
+    const legacy = rejection('evt_assigned');
+    const { basis_event_id: _ignored, ...withoutBasis } = legacy;
+
+    const action = only(
+      decisionContext({
+        workflow_instance: workflowWith({ last_processed_event_id: 'evt_new_fact' }),
+        previous_decisions: [{ ...withoutBasis, basis_event_id: undefined as unknown as string | null }],
+      }),
+    );
+
+    expect(action).toMatchObject({ action_type: 'send_email', requires_approval: true });
+  });
+
   it('被拒绝后仍可提出类型不同的替代动作', () => {
     const action = only(
       decisionContext({
-        previous_decisions: [
-          {
-            action_id: 'action_old',
-            action_type: 'send_email',
-            status: 'rejected',
-            plan_version: 1,
-            decided_by: 'user_9',
-            reason: '不发送该模板',
-            decided_at: '2026-09-24T10:04:00+08:00',
-          },
-        ],
+        previous_decisions: [rejection('evt_assigned')],
         pending_tasks: [
           {
             task_id: 'task_1',
@@ -404,6 +422,7 @@ describe('RuleBasedDecider 拒绝原因即规划约束', () => {
             decided_by: 'user_9',
             reason: null,
             decided_at: '2026-09-24T10:04:00+08:00',
+            basis_event_id: 'evt_assigned',
           },
         ],
       }),

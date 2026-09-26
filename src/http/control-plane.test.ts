@@ -16,7 +16,10 @@ import {
 } from '../stores/in-memory';
 import type { ContactState, DealState, LeadState } from '../stores/types';
 import {
+  contactRecordedEvent,
   contactState,
+  dealCreatedEvent,
+  dealStageChangedEvent,
   emailRepliedEvent,
   emailSentEvent,
   leadAssignedEvent,
@@ -63,7 +66,7 @@ function buildStack(executorOverride?: WorkflowEngineOptions['executor']) {
     policy: new RuleBasedPolicyEvaluator(),
     contact_defaults: () => contactState(),
   });
-  return { engine, workflows, audit, exceptions, pendingActions };
+  return { engine, workflows, audit, exceptions, pendingActions, leads, contacts, deals };
 }
 
 async function startServer(
@@ -98,6 +101,8 @@ async function startServer(
       audit_log: stack.audit,
       exception_queue: stack.exceptions,
       pending_action_store: stack.pendingActions,
+      lead_store: stack.leads,
+      deal_store: stack.deals,
       config,
       metrics,
       ...(options.controlPlaneRateLimit === undefined
@@ -189,6 +194,27 @@ describe('控制面 HTTP 入口', () => {
     expect((await call(baseUrl, '/workflows/wf_missing', { token: 'secret' })).status).toBe(404);
   });
 
+  it('Policy 拒绝的动作不出现在待审批列表里', async () => {
+    const { engine, baseUrl, pendingActions } = await startServer({ token: 'secret' });
+    await engine.handleEvent(
+      leadCreatedEvent({ payload: { ...leadCreatedEvent().payload, contact_id: 'contact_1' } }),
+    );
+    await engine.handleEvent(
+      contactRecordedEvent({ payload: { ...contactRecordedEvent().payload, contactability: 'unsubscribed' } }),
+    );
+    await engine.handleEvent(leadAssignedEvent());
+
+    const listed = await (await call(baseUrl, '/workflows', { token: 'secret' })).json() as {
+      items: Array<{ status: string; pending_action: { action_id: string } | null }>;
+    };
+    expect(listed.items[0]).toMatchObject({ status: 'waiting_result', pending_action: null });
+    expect(engine.pendingAction(WORKFLOW_ID)).toBeNull();
+
+    const policyRejected = pendingActions.list().filter((record) => record.decision === 'policy_rejected');
+    expect(policyRejected).toHaveLength(1);
+    expect(policyRejected[0]).toMatchObject({ status: 'decided', decided_by: 'policy' });
+  });
+
   it('POST approve 让 Human Review 分支真正执行动作', async () => {
     const { engine, workflows, pendingActions, baseUrl } = await startServer({ token: 'secret' });
     const actionId = await driveToReview(engine);
@@ -204,6 +230,7 @@ describe('控制面 HTTP 入口', () => {
       status: 'waiting_result',
       awaiting_event_types: ['meeting.scheduled'],
       pending_action: null,
+      stale_action_replanned: false,
     });
     expect(pendingActions.get(actionId)).toMatchObject({ status: 'decided', decision: 'approved', decided_by: 'user_7' });
     expect(workflows.get(WORKFLOW_ID)?.status).toBe('waiting_result');
@@ -242,6 +269,60 @@ describe('控制面 HTTP 入口', () => {
 
     expect(response.status).toBe(409);
     expect(((await response.json()) as { error: string }).error).toContain('审核动作不可用');
+  });
+
+  it('POST approve 遇到失效动作时改为重新规划并标记 stale_action_replanned', async () => {
+    const { engine, pendingActions, audit, baseUrl } = await startServer({ token: 'secret' });
+    const actionId = await driveToReview(engine);
+
+    // 审核期间联系人退订，Policy 判定待审动作已失效
+    await engine.handleEvent(
+      contactRecordedEvent({ payload: { ...contactRecordedEvent().payload, contactability: 'unsubscribed' } }),
+    );
+
+    const response = await call(baseUrl, `/workflows/${WORKFLOW_ID}/approve`, {
+      method: 'POST',
+      token: 'secret',
+      body: { action_id: actionId, actor_id: 'user_7' },
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ stale_action_replanned: true, pending_action: null });
+    expect(pendingActions.get(actionId)).toMatchObject({ status: 'decided', decision: null, decided_by: 'user_7' });
+    expect(audit.list().some((entry) => entry.action === 'action_stale' && entry.action_id === actionId)).toBe(true);
+  });
+
+  it('POST /workflows/:id/replan 作废旧待审动作并重新规划', async () => {
+    const { engine, pendingActions, baseUrl } = await startServer({ token: 'secret' });
+    const actionId = await driveToReview(engine);
+
+    const response = await call(baseUrl, `/workflows/${WORKFLOW_ID}/replan`, {
+      method: 'POST',
+      token: 'secret',
+      body: { actor_id: 'user_7' },
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ status: 'needs_review' });
+    expect(pendingActions.get(actionId)).toMatchObject({ status: 'decided', decision: null, decided_by: 'user_7' });
+    expect(engine.pendingAction(WORKFLOW_ID)?.action_id).not.toBe(actionId);
+  });
+
+  it('POST /replan 对非待审实例返回 409，缺 Token 返回 401', async () => {
+    const { engine, baseUrl } = await startServer({ token: 'secret' });
+    await engine.handleEvent(leadCreatedEvent());
+
+    expect(
+      (await call(baseUrl, `/workflows/${WORKFLOW_ID}/replan`, { method: 'POST', body: { actor_id: 'user_7' } })).status,
+    ).toBe(401);
+
+    const conflict = await call(baseUrl, `/workflows/${WORKFLOW_ID}/replan`, {
+      method: 'POST',
+      token: 'secret',
+      body: { actor_id: 'user_7' },
+    });
+    expect(conflict.status).toBe(409);
+    expect(((await conflict.json()) as { error: string }).error).toContain('只有待审核实例可以重新规划');
   });
 
   it('实例不存在时返回 404，与状态冲突的 409 区分开', async () => {
@@ -630,5 +711,138 @@ describe('控制面限流与来源识别', () => {
       token: 'secret',
       headers: { 'x-forwarded-for': '198.51.100.9' },
     })).status).toBe(429);
+  });
+});
+
+describe('销售读端点 /leads 与 /deals', () => {
+  it('GET /leads 列出线索，支持 owner_id / status 过滤、分页与单条详情', async () => {
+    const { baseUrl, engine } = await startServer({ token: 'secret' });
+    await engine.handleEvent(leadCreatedEvent());
+    await engine.handleEvent(leadAssignedEvent());
+    await engine.handleEvent(
+      leadCreatedEvent({
+        event_id: 'evt_lead_2',
+        idempotency_key: 'lead.created:crm:rec_1002',
+        payload: {
+          ...leadCreatedEvent().payload,
+          lead_id: 'lead_2',
+          source_channel: 'import',
+          source_record_id: 'rec_1002',
+          company_name: 'Beta',
+          contact_id: null,
+          initial_owner_id: 'user_9',
+        },
+      }),
+    );
+
+    const all = await (await call(baseUrl, '/leads', { token: 'secret' })).json() as {
+      items: Array<{ lead_id: string }>;
+      count: number;
+      total: number;
+      has_more: boolean;
+      limit: number;
+    };
+    expect(all.total).toBe(2);
+    expect(all.count).toBe(2);
+    expect(all.has_more).toBe(false);
+    expect(all.items.map((lead) => lead.lead_id).sort()).toEqual(['lead_1', 'lead_2']);
+
+    const mine = await (await call(baseUrl, '/leads?owner_id=user_7', { token: 'secret' })).json() as {
+      items: Array<{ lead_id: string }>;
+      total: number;
+    };
+    expect(mine.items.map((lead) => lead.lead_id)).toEqual(['lead_1']);
+    expect(mine.total).toBe(1);
+
+    const assigned = await (await call(baseUrl, '/leads?status=assigned', { token: 'secret' })).json() as {
+      items: Array<{ lead_id: string }>;
+    };
+    expect(assigned.items.map((lead) => lead.lead_id)).toEqual(['lead_1']);
+
+    const paged = await (await call(baseUrl, '/leads?limit=1', { token: 'secret' })).json() as {
+      items: Array<{ lead_id: string }>;
+      count: number;
+      total: number;
+      has_more: boolean;
+    };
+    expect(paged).toMatchObject({ count: 1, total: 2, has_more: true });
+
+    const detail = await call(baseUrl, '/leads/lead_1', { token: 'secret' });
+    expect(detail.status).toBe(200);
+    expect(await detail.json()).toMatchObject({
+      lead_id: 'lead_1',
+      company_name: 'Acme',
+      owner_id: 'user_7',
+      status: 'assigned',
+    });
+
+    expect((await call(baseUrl, '/leads/lead_missing', { token: 'secret' })).status).toBe(404);
+    expect((await call(baseUrl, '/leads')).status).toBe(401);
+  });
+
+  it('GET /deals 按 stage / owner_id / lead_id 过滤，并返回单条详情', async () => {
+    const { baseUrl, engine } = await startServer({ token: 'secret' });
+    await engine.handleEvent(leadCreatedEvent());
+    await engine.handleEvent(dealCreatedEvent());
+    await engine.handleEvent(
+      dealCreatedEvent({
+        event_id: 'evt_deal_2',
+        idempotency_key: 'deal.created:deal_2',
+        payload: {
+          ...dealCreatedEvent().payload,
+          deal_id: 'deal_2',
+          owner_id: 'user_9',
+        },
+      }),
+    );
+    // Deal 只能从 qualification 建立，再按状态机推进到 discovery
+    await engine.handleEvent(
+      dealStageChangedEvent({
+        event_id: 'evt_deal_2_discovery',
+        idempotency_key: 'deal.stage_changed:deal_2:qualification:discovery',
+        payload: { ...dealStageChangedEvent().payload, deal_id: 'deal_2', from_stage: 'qualification', to_stage: 'discovery' },
+      }),
+    );
+
+    const all = await (await call(baseUrl, '/deals', { token: 'secret' })).json() as {
+      items: Array<{ deal_id: string }>;
+      total: number;
+      has_more: boolean;
+    };
+    expect(all.total).toBe(2);
+    expect(all.has_more).toBe(false);
+    expect(all.items.map((deal) => deal.deal_id).sort()).toEqual(['deal_1', 'deal_2']);
+
+    const byStage = await (await call(baseUrl, '/deals?stage=discovery', { token: 'secret' })).json() as {
+      items: Array<{ deal_id: string }>;
+      total: number;
+    };
+    expect(byStage.items.map((deal) => deal.deal_id)).toEqual(['deal_2']);
+    expect(byStage.total).toBe(1);
+
+    const byOwner = await (await call(baseUrl, '/deals?owner_id=user_7', { token: 'secret' })).json() as {
+      items: Array<{ deal_id: string }>;
+    };
+    expect(byOwner.items.map((deal) => deal.deal_id)).toEqual(['deal_1']);
+
+    const byLead = await (await call(baseUrl, '/deals?lead_id=lead_1', { token: 'secret' })).json() as {
+      items: Array<{ deal_id: string }>;
+      total: number;
+    };
+    expect(byLead.total).toBe(2);
+
+    const detail = await call(baseUrl, '/deals/deal_1', { token: 'secret' });
+    expect(detail.status).toBe(200);
+    expect(await detail.json()).toMatchObject({
+      deal_id: 'deal_1',
+      lead_id: 'lead_1',
+      owner_id: 'user_7',
+      stage: 'qualification',
+      amount: 120000,
+      currency: 'CNY',
+    });
+
+    expect((await call(baseUrl, '/deals/deal_missing', { token: 'secret' })).status).toBe(404);
+    expect((await call(baseUrl, '/deals')).status).toBe(401);
   });
 });

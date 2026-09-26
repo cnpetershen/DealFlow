@@ -62,7 +62,8 @@
 | Workflow `running` | 流程结束 | 无后续步骤且无待办 | `completed` | 结束自动动作，写入审计记录 |
 | Workflow `waiting_result` | 匹配的结果事件 | 事件满足等待条件 | `replanning` | 消费结果事件，计算下一节点 |
 | Workflow `needs_review` | 人工批准 | ProposedAction 被批准 | `replanning` | 按批准结果重新规划，不直接复用旧计划 |
-| Workflow `needs_review` | 人工拒绝 | ProposedAction 被拒绝 | `replanning` | 记录拒绝原因，基于新约束重新规划 |
+| Workflow `needs_review` | 人工拒绝 | ProposedAction 被拒绝 | `replanning` | 记录拒绝原因与 `basis_event_id`，基于新约束重新规划；新事件进入前不重提同一动作类型 |
+| Workflow `needs_review` | 动作失效 / 人工重新规划 | 待审动作已被新事实取代、已过期，或控制面要求重来（触发器 `stale_action`） | `replanning` | 作废待审动作（不写拒绝结论），基于当前 State 重新规划 |
 | Workflow `replanning` | 规划完成 | 已生成新的 `plan_version`，或确认无安全替代动作 | `running` / `waiting_result` / `needs_review` | 进入新计划的首个可执行步骤，或转为等待、人工审核 |
 | Workflow `replanning` | 流程结束 | 无后续步骤且无待办 | `completed` | 结束自动动作，写入审计记录 |
 | Workflow `failed` | 重试 | `transient` 且 `submitted !== 'unknown'` | `running` | 复用同一 `idempotency_key` 重试（可由 `RetryScheduler` 自动触发，见 `docs/deployment.md` 第 5.2 节） |
@@ -94,7 +95,9 @@ Decider 暂时提不出动作时，Workflow **不能**直接 `completed`：Lead 
 | 派发动作后等结果 | 动作类型（如 `send_email`） | 该动作的结果事件（`RESULT_EVENTS`） | 否（避免动作在途时重复派发） |
 | 推导等待 | `await_event` | 推导出的可推进事件集合 | 是（此时没有动作在途） |
 
-`needs_review` 期间到达的非事实类事件：合并可安全合并的事实，写入异常队列（`invalid_transition`），但不擅自推进 Workflow —— 既不静默覆盖，也不静默丢弃。
+`needs_review` 期间到达的非事实类事件：合并可安全合并的事实，并按 `processed` 消费该事件，写入异常队列（`awaiting_approval`）等待人工判断，但不擅自推进 Workflow —— 既不静默覆盖，也不静默丢弃，也不把「等审批」报成处理失败。事实本身非法的事件仍被判 `failed`（`stale_event` / `invalid_transition`）。实例离开 `needs_review` 时，该类异常随审批自动关闭。
+
+终态（`completed` / `cancelled`）实例上到达的非事实类事件：同样合并事实并按 `processed` 消费，写入异常队列（`workflow_ended`）交人工判断是否需要新建后续流程，但 Workflow 自身保持终态、不重新规划。它不是「无人认领的事件」，因此不记 `unmatched_event`；事实本身非法时仍判 `failed`（`stale_event` / `invalid_transition`）。
 
 ## Workflow Resume 规则
 
@@ -106,7 +109,7 @@ Decider 暂时提不出动作时，Workflow **不能**直接 `completed`：Lead 
 6. **计划版本递增**：每次重新规划生成新的 `plan_version`。旧计划的未执行动作不得自动复用，除非新计划明确确认仍然有效。
 7. **迟到和冲突事件**：依据实体版本和阶段迁移规则处理。不能安全合并的事件必须保留并转 `needs_review`，不可静默覆盖当前事实。
 8. **失败可重试**：事件已落库但处理失败时，重试必须复用同一个 `idempotency_key`，不能产生第二次业务效果。失败分类与 `submitted` 写入 WorkflowInstanceState 的 `failure_classification` / `failure_submitted` / `failure_retry_after`，重启后仍生效。`transient` 且 `submitted !== 'unknown'` 时允许自动重试；`permanent` 或 `submitted === 'unknown'` 时 `retry` 必须拒绝。见 `docs/domain.md`「Executor Error Contract」与「Audit 契约」。
-9. **终态保护**：Lead 已 `disqualified`/`closed` 或 Deal 已 `won`/`lost` 后，默认不再自动恢复原 Workflow；新事实只能产生明确的后续流程或人工审核。
+9. **终态保护**：Lead 已 `disqualified`/`closed` 或 Deal 已 `won`/`lost` 后，默认不再自动恢复原 Workflow；新事实只能产生明确的后续流程或人工审核。已经结束（`completed` / `cancelled`）的实例上再到达的事件按 `processed` 消费并以 `workflow_ended` 进入异常队列，事实照常合并，但原流程不被重新唤醒。
 10. **审计先行**：状态迁移、Decision、Policy 结论、人工操作和执行结果均追加 Audit Log，Audit Log 不可修改。
 11. **崩溃恢复重放**：EventStore 中的事件是恢复的唯一事实来源。重启后对空 State Store 调用 `recoverFromEventLog()`，按 `sequence` 重放全部事件重建 State；`pending` 事件完整处理并 `markProcessed`，已处理事件幂等重放。事件仍为 `pending` 且 Workflow 已是 `failed` 时，重投事件按 `retry` 语义先恢复 `running` 再规划。多 worker 并发时通过事件处理租约（claim lease）保证同一 `idempotency_key` 同一时刻仅一个 worker 处理。
 

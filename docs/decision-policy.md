@@ -85,6 +85,7 @@ Policy 对每一个 ProposedAction 独立判断，输出：
 4. 把批准后的动作交给接口化 Executor，并使用稳定的执行幂等 key。
 5. 不把“已批准”当作“已发生”；必须等待外部结果事件更新 State 并恢复 Workflow。
 6. 若执行失败，追加失败 Audit Log，并按失败策略重试或转人工处理。
+7. 若第 2 条复核发现动作已失效：不执行该动作，而是作废它（`decision` 留空、审计 `action_stale`）并按当前 State 重新规划，响应中的 `stale_action_replanned` 为 `true`。失效不写入 `previous_decisions`——计划过时不等于人工否决这个动作类型，否则一次过期会永久拉黑它。
 
 ### Rejected
 
@@ -94,6 +95,11 @@ Policy 对每一个 ProposedAction 独立判断，输出：
 4. 进入 `replanning`，重新读取当前 State 和最新事件，生成新的 ProposedAction。
 5. 新动作必须拥有新的 `action_id` 和 `plan_version`，并重新经过 Policy 判断。
 6. 如果没有安全替代动作，则进入 `waiting_result`、`needs_review` 或结束 Workflow，而不是无限循环规划。
+7. 约束的有效期锚定在拒绝时已处理的最后一条事件上（`previous_decisions[].basis_event_id`）：
+   只要没有更新的事件进入，同一动作类型不会被重新提出，避免“拒绝 → 立刻原样重提 → 再拒绝”的拉锯。
+8. 新事件进入后，同一动作类型可以被重新提出，但 Decider 必须把它标记为 `requires_approval: true`，
+   重新经过 Policy 与人工审批——不得因为约束解封就绕过上一次人工拒绝自动执行。
+   历史数据缺少 `basis_event_id` 时按本条处理：可重新提出、但必须审核，不永久阻断。
 
 所有 Approved、Rejected、Policy 结果、Executor 调用和外部结果都写入只追加 Audit Log。Audit Log 不用于直接覆盖 State。
 
@@ -106,7 +112,9 @@ Policy 对每一个 ProposedAction 独立判断，输出：
 - `verified_config`：已验证配置（邮件模板、方案文档引用、默认会议时长）。缺少对应配置时 Decider 直接放弃该动作，不编造参数。
 - `data_conflicts`：State 与事件、Memory 或 CRM 数据之间的冲突说明。非空表示事实不可信。
 - `policy_context`：Policy 版本、判定时刻 `evaluated_at`、自动化白名单、组织允许的动作类型边界、允许的操作者、业务时区偏移、发送窗口、每日自动动作上限、关键客户与高价值阈值。
-- `previous_decisions`：相关 ProposedAction 的历史结论。状态为 `rejected` 的动作类型不再被重复提出，拒绝原因因此成为新的规划约束。
+- `previous_decisions`：相关 ProposedAction 的历史结论。状态为 `rejected` 的动作类型，在其 `basis_event_id`
+  仍是最后一条已处理事件期间不会被重复提出；新事件进入后可以重新提出，但 `requires_approval` 强制为 `true`。
+  拒绝原因因此成为**有边界**的规划约束：既不会被无视，也不会永久拉黑该动作类型。
 
 ### 判定顺序
 
@@ -150,5 +158,8 @@ Policy 固定按 `Reject` → `Human Review` → `Auto` 判定：
 
 `Approved` 的第 2 条由引擎在批准时执行：重新构造 Context 并让 Policy 再判一次，命中任一硬性禁止项
 （`action_expired`、`stale_plan_version`、`terminal_subject`、`unsubscribed_contact`、`unauthorized_action`、
-`missing_idempotency_key`、`already_executed`）就拒绝执行该动作，要求人工重新规划。
-审批入口开放在控制面上，不能假设审核人一定看得到最新 State。
+`missing_idempotency_key`、`already_executed`）即判定该动作已失效。
+失效既不执行也不报错：作废旧动作、写 `action_stale` 审计、按当前 State 重新规划（`needs_review` + `stale_action` → `replanning`），
+实例因此离开 `needs_review`，控制面响应里的 `stale_action_replanned` 为 `true`。
+审批入口开放在控制面上，不能假设审核人一定看得到最新 State；把决定权交回 Decider，比让实例卡死或直接报错更可推进。
+控制面另提供 `POST /workflows/{id}/replan`：人工主动作废待审动作并重新规划，审计记 `replan_requested`，同样不写拒绝结论。

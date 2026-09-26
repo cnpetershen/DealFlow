@@ -192,9 +192,9 @@ describe('事实类事件不会因等待条件被丢弃', () => {
     );
 
     expect(deals.get('deal_a')?.stage).toBe('discovery');
-    expect(result.status).toBe('failed');
+    expect(result.status).toBe('processed');
     expect(workflows.get(WORKFLOW_ID)?.status).toBe('needs_review');
-    expect(exceptions.listOpen().some((record) => record.reason === 'invalid_transition')).toBe(true);
+    expect(exceptions.listOpen().some((record) => record.reason === 'awaiting_approval')).toBe(true);
   });
 });
 
@@ -343,15 +343,15 @@ describe('重启后 Human Review 仍可审批', () => {
       policy: new RuleBasedPolicyEvaluator(),
     });
 
-    const workflow = await rebooted.approve(WORKFLOW_ID, actionId, 'user_7');
+    const { workflow } = await rebooted.approve(WORKFLOW_ID, actionId, 'user_7');
 
     expect(workflow).toMatchObject({ status: 'waiting_result', awaiting_event_types: ['meeting.scheduled'] });
   });
 });
 
 describe('审批前复核动作有效性', () => {
-  it('主体已进入终态时拒绝执行陈旧动作，要求人工重新规划', async () => {
-    const { engine, workflows } = buildStack({ contactEmail: 'buyer@acme.example' });
+  it('主体已进入终态时不执行陈旧动作：作废并按新事实重新规划', async () => {
+    const { engine, workflows, audit } = buildStack({ contactEmail: 'buyer@acme.example' });
 
     await engine.handleEvent(leadWithContact());
     await engine.handleEvent(leadAssignedEvent());
@@ -373,13 +373,14 @@ describe('审批前复核动作有效性', () => {
       }),
     );
 
-    // 此时批准「推进到 discovery」已经失效：Deal 是终态
-    await expect(engine.approve(WORKFLOW_ID, advance, 'user_7')).rejects.toThrow('待审核动作已失效');
-    expect(workflows.get(WORKFLOW_ID)?.status).toBe('needs_review');
+    // 此时批准「推进到 discovery」已经失效：Deal 是终态，动作作废并重新规划，不再卡在 needs_review
+    const outcome = await engine.approve(WORKFLOW_ID, advance, 'user_7');
 
-    // 人工拒绝后按新事实重新规划：Deal 终态 → 流程结束
-    const after = await engine.reject(WORKFLOW_ID, advance, 'user_7', 'Deal 已成交，阶段推进不再适用');
-    expect(after.status).toBe('completed');
+    expect(outcome.stale_action_replanned).toBe(true);
+    expect(outcome.workflow.status).toBe('completed');
+    expect(workflows.get(WORKFLOW_ID)?.status).toBe('completed');
+    expect(audit.list().some((entry) => entry.action === 'action_stale' && entry.action_id === advance)).toBe(true);
+    expect(audit.list().some((entry) => entry.action === 'action_approved' && entry.action_id === advance)).toBe(false);
   });
 });
 

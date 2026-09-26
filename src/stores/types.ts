@@ -13,6 +13,8 @@ export type AuditAction =
   | 'policy_rejected'
   | 'action_approved'
   | 'action_rejected'
+  | 'action_stale'
+  | 'replan_requested'
   | 'action_dispatched'
   | 'action_failed'
   | 'action_reconciled'
@@ -92,6 +94,10 @@ export type ExceptionReason =
   | 'unmatched_event'
   | 'stale_event'
   | 'invalid_transition'
+  /** 流程停在 needs_review，事件已合并但需等人工审批才能推进。 */
+  | 'awaiting_approval'
+  /** 实例已进入终态（completed / cancelled），事件已按事实接收，需人工决定是否新建后续流程。 */
+  | 'workflow_ended'
   | 'processing_error';
 
 export type ExceptionStatus = 'open' | 'resolved' | 'discarded';
@@ -270,7 +276,12 @@ export interface PendingActionRecord {
   action_id: string;
   workflow_instance_id: string;
   status: PendingActionStatus;
-  decision: 'approved' | 'rejected' | null;
+  /**
+   * 审批结论。`policy_rejected` 与人工 `rejected` 必须可区分：
+   * 前者是每次规划时重新判定的动态结论，后者是人工写入 State 的规划约束
+   * （对应 docs/mvp.md「Audit Log 中记录 Rejected 与 Policy Reject 的区别」）。
+   */
+  decision: 'approved' | 'rejected' | 'policy_rejected' | null;
   decided_by: string | null;
   decided_at: string | null;
   proposed_at: string;

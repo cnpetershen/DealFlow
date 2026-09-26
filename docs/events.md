@@ -194,7 +194,7 @@ Deal 只能通过该事件进入系统。`deal.stage_changed` 只负责推进已
 1. **如何关联 `action_id` / `execution_idempotency_key`**：结果事件通过 `workflow_instance_id`（或 `lead_id`）+ 事件类型匹配 Workflow 当前 `awaiting_event_types`；提供商对账通过 `provider_reference` / `correlation_id` 反查执行记录。MVP 不强制要求 payload 内嵌 `action_id`。
 2. **`provider_reference` 是否参与幂等**：不参与信封 `idempotency_key` 计算。事件幂等仍以 `idempotency_key` 为唯一去重键；`provider_reference` 用于审计追溯与人工对账。
 3. **重复结果事件**：同一 `idempotency_key` 第二次投递返回 `duplicate`，不产生第二次业务效果；接收路径可保留 `event_processed` 审计（含 `provider_reference`）。
-4. **未知 Action / 无法匹配的结果**：进入异常队列（`unmatched_event`），不静默丢弃。
+4. **未知 Action / 无法匹配的结果**：进入异常队列（`unmatched_event`），不静默丢弃。真正「无人认领」才记 `unmatched_event`；落在已结束（`completed` / `cancelled`）实例上的事件匹配得到主体，按 `processed` 消费并记 `workflow_ended`。
 5. **必须携带 `provider_reference` 的事件**：所有由提供商 webhook 驱动的结果事件（`email.sent`、`email.replied`、`meeting.scheduled`、`proposal.sent`）在提供商可用时必须提供；缺失时为 `null`，并允许进入异常队列做人工对账。
 
 ### 与审计的关系

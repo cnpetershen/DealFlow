@@ -285,6 +285,12 @@ describe('Workflow 迁移校验', () => {
     ).toEqual(['replanning']);
   });
 
+  it('needs_review 的失效动作重新规划进入 replanning', () => {
+    expect(expectAllowed(validateWorkflowTransition('needs_review', 'stale_action')).to).toEqual([
+      'replanning',
+    ]);
+  });
+
   it('replanning + replan_completed 允许 running / waiting_result / needs_review', () => {
     expect(expectAllowed(validateWorkflowTransition('replanning', 'replan_completed')).to).toEqual([
       'running',

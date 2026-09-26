@@ -62,6 +62,15 @@ export interface PreviousDecision {
   decided_by: string | null;
   reason: string | null;
   decided_at: string | null;
+  /**
+   * 拒绝时 Workflow 已处理的最后一条事件（`workflow_instance.last_processed_event_id`）。
+   *
+   * 约束的有效期就锚定在它上面：同一上下文（没有更新的事件）不会重复提出同一个动作，
+   * 避免「拒绝→立即重新提出→再拒绝」的拉锯；新事件进入后可以重新提出，
+   * 但必须再次人工审核，不得因为解封而绕过上一次人工拒绝自动执行。
+   * 历史数据没有该字段时按「可重新提出、但必须审核」处理，不永久阻断。
+   */
+  basis_event_id?: string | null;
 }
 
 /** 适用的 Policy 版本、组织规则、时间窗口、权限与合规限制。 */

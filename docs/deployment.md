@@ -126,11 +126,16 @@ User=dealflow
 | `POST` | `<DEALFLOW_WEBHOOK_PATH>` | 接收事件 |
 | `GET` | `/workflows` | 控制面：列出实例（可用 `?status=` 过滤），含待审批动作 |
 | `GET` | `/workflows/{id}` | 控制面：实例详情 + 当前待审批 `action_id` |
-| `POST` | `/workflows/{id}/approve` | 控制面：`{action_id, actor_id}` 批准并交 Executor 执行 |
+| `POST` | `/workflows/{id}/approve` | 控制面：`{action_id, actor_id}` 批准并交 Executor 执行；动作已失效时改为作废并重新规划（响应 `stale_action_replanned`） |
 | `POST` | `/workflows/{id}/reject` | 控制面：`{action_id, actor_id, reason}` 拒绝并基于新约束重新规划 |
+| `POST` | `/workflows/{id}/replan` | 控制面：`{actor_id?}` 作废待审动作并按当前 State 重新规划（不写批准/拒绝结论） |
 | `POST` | `/workflows/{id}/cancel` | 控制面：`{actor_id}` 取消实例 |
 | `POST` | `/workflows/{id}/retry` | 控制面：重试失败实例（分类与 `submitted` 由引擎判定） |
 | `POST` | `/workflows/{id}/reconcile` | 控制面：`{actor_id}` 对 Provider 对账，确认不确定提交是否真的落到提供商侧 |
+| `GET` | `/leads` | 控制面销售读端点：列出线索（`?owner_id=&status=&limit=&offset=`），返回 `{items, count, total, has_more, limit, offset}` |
+| `GET` | `/leads/{id}` | 控制面销售读端点：单条线索当前事实，不存在回 `404` |
+| `GET` | `/deals` | 控制面销售读端点：列出售机（`?owner_id=&stage=&lead_id=&limit=&offset=`），响应结构同 `/leads` |
+| `GET` | `/deals/{id}` | 控制面销售读端点：单条商机当前事实，不存在回 `404` |
 | `GET` | `/audit` | 控制面：审计查询（`?workflow_instance_id=&event_id=&action_id=&limit=&order=`） |
 | `GET` | `/exceptions` | 控制面：异常队列（默认 `status=open`，可 `status=all`） |
 | `POST` | `/exceptions/{id}/resolve` | 控制面：`{resolution, reason?, actor_id?}` 标记已处理并写审计 |
@@ -150,7 +155,10 @@ User=dealflow
 - 控制面不做 HMAC 签名校验，也不参与 Webhook 限流，建议只在内网或 VPN 内暴露；
 - 人工审核流程：`GET /workflows?status=needs_review` 取 `pending_action.action_id` → `POST /workflows/{id}/approve`。
   批准前引擎会按 `docs/decision-policy.md`「Approved」第 2 条重新校验动作是否已过期、是否已被新事件取代
-  （主体进入终态、联系人退订、`plan_version` 不一致等），失效动作会被拒绝并需要人工重新规划。
+  （主体进入终态、联系人退订、`plan_version` 不一致等）：命中即判定动作失效，引擎作废旧动作、
+  写 `action_stale` 审计并按当前 State 重新规划，实例离开 `needs_review`，响应 `stale_action_replanned: true`；
+  需要人工主动作废待审动作时用 `POST /workflows/{id}/replan`（审计记 `replan_requested`）。
+  两者都不写拒绝结论，因此同一动作类型仍可被重新提出。
 
 ## 5.1 启动恢复
 

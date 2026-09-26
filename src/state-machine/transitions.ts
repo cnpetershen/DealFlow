@@ -200,6 +200,7 @@ export const WORKFLOW_TRIGGERS = [
   'result_event_matched',
   'approval_granted',
   'approval_rejected',
+  'stale_action',
   'replan_completed',
   'processing_error',
   'retry',
@@ -273,6 +274,13 @@ export const WORKFLOW_TRANSITIONS: readonly TransitionRow<WorkflowStatus, Workfl
     to: ['replanning'],
     condition: 'ProposedAction 被拒绝',
     workflow_action: '记录拒绝原因，基于新约束重新规划',
+  },
+  {
+    from: 'needs_review',
+    trigger: 'stale_action',
+    to: ['replanning'],
+    condition: '待审动作已被新事实取代、已过期，或人工要求重新规划',
+    workflow_action: '作废待审动作（不写拒绝结论），基于当前 State 重新规划',
   },
   {
     from: 'replanning',

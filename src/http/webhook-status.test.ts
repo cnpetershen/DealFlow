@@ -14,7 +14,7 @@ import {
   InMemoryWorkflowStateStore,
 } from '../stores/in-memory';
 import type { ContactState, DealState, LeadState } from '../stores/types';
-import { contactState, emailSentEvent, leadAssignedEvent, leadCreatedEvent } from '../testing/fixtures';
+import { contactState, emailRepliedEvent, emailSentEvent, leadAssignedEvent, leadCreatedEvent, meetingScheduledEvent } from '../testing/fixtures';
 import { WorkflowEngine } from '../workflow/engine';
 import { createWebhookServer } from './webhook';
 
@@ -119,6 +119,30 @@ describe('Webhook response status contract', () => {
       event_status: 'unmatched',
       workflow_id: null,
       workflow_status: null,
+    });
+  });
+
+  it('returns processed when an event arrives while the workflow awaits human approval', async () => {
+    const { url } = await start();
+    await post(url, leadCreatedEvent({
+      payload: { ...leadCreatedEvent().payload, contact_id: 'contact_1' },
+    }));
+    await post(url, leadAssignedEvent());
+    await post(url, emailSentEvent());
+    await post(url, emailRepliedEvent());
+
+    const result = await post(url, meetingScheduledEvent({
+      event_id: 'evt_late_receipt',
+      idempotency_key: 'meeting.scheduled:mtg_late',
+      payload: { ...meetingScheduledEvent().payload, meeting_id: 'mtg_late' },
+    }));
+
+    expect(result.http).toBe(200);
+    expect(result.body).toMatchObject({
+      status: 'processed',
+      event_status: 'processed',
+      workflow_id: 'wf_lead_follow_up_lead_1',
+      workflow_status: 'needs_review',
     });
   });
 

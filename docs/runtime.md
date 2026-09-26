@@ -71,11 +71,15 @@ interface ProviderAdapter {
 
 ## 控制面
 
-`createControlPlaneHandler({ engine, audit_log, exception_queue, pending_action_store, config, metrics })`：
+`createControlPlaneHandler({ engine, audit_log, exception_queue, pending_action_store, lead_store, deal_store, config, metrics })`：
 
-- 人工审核：`POST /workflows/{id}/approve|reject`，让 `needs_review` 的流程真正可被外部推进；
+- 人工审核：`POST /workflows/{id}/approve|reject|replan`，让 `needs_review` 的流程真正可被外部推进
+  （批准时发现动作已失效会自动转为重新规划，响应带 `stale_action_replanned`）；
 - 控制操作：`POST /workflows/{id}/cancel|retry`；
 - 只读查询：`GET /workflows`、`GET /workflows/{id}`、`GET /audit`、`GET /exceptions`；
+- 销售读端点：`GET /leads`、`GET /leads/{id}`、`GET /deals`、`GET /deals/{id}`，直接读
+  `lead_store` / `deal_store` 里的当前事实，支持 `owner_id` / `status`（线索）与
+  `owner_id` / `stage` / `lead_id`（商机）过滤，列表返回统一的 `{items, count, total, has_more, limit, offset}`；
 - 异常处理：`POST /exceptions/{id}/resolve|discard`（此前只存在于 Store 层，没有任何运维入口）。
 
 鉴权：`control_plane.bearer_token`，为空回退 `webhook.bearer_token`；两者都为空时不注册路由（`404`）。

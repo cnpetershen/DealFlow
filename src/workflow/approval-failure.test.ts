@@ -66,7 +66,7 @@ describe('WorkflowEngine 批准执行失败（dispatchAction 统一路径）', (
     const actionId = await driveToReview(engine, audit);
 
     executor.failNext(Object.assign(new Error('provider unavailable'), { classification: 'transient' as const }));
-    const result = await engine.approve(WORKFLOW_ID, actionId, 'user_7');
+    const { workflow: result } = await engine.approve(WORKFLOW_ID, actionId, 'user_7');
 
     expect(result).toMatchObject({
       status: 'failed',
@@ -90,7 +90,7 @@ describe('WorkflowEngine 批准执行失败（dispatchAction 统一路径）', (
     const actionId = await driveToReview(engine, audit);
 
     executor.failNext(Object.assign(new Error('invalid recipient'), { classification: 'permanent' as const }));
-    const result = await engine.approve(WORKFLOW_ID, actionId, 'user_7');
+    const { workflow: result } = await engine.approve(WORKFLOW_ID, actionId, 'user_7');
 
     expect(result).toMatchObject({
       status: 'failed',
@@ -111,7 +111,7 @@ describe('WorkflowEngine 批准执行失败（dispatchAction 统一路径）', (
     const actionId = await driveToReview(engine, audit);
 
     executor.failNext(Object.assign(new Error('provider timeout'), { code: 'TIMEOUT' }));
-    const result = await engine.approve(WORKFLOW_ID, actionId, 'user_7');
+    const { workflow: result } = await engine.approve(WORKFLOW_ID, actionId, 'user_7');
 
     expect(result).toMatchObject({
       status: 'failed',
@@ -138,7 +138,7 @@ describe('WorkflowEngine 批准执行失败（dispatchAction 统一路径）', (
         submitted: 'unknown' as const,
       }),
     );
-    const result = await engine.approve(WORKFLOW_ID, actionId, 'user_7');
+    const { workflow: result } = await engine.approve(WORKFLOW_ID, actionId, 'user_7');
 
     expect(result).toMatchObject({
       status: 'failed',

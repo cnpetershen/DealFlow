@@ -4,7 +4,7 @@ import type { DealFlowConfig } from '../config/config';
 import { BusinessError, classifyError } from '../errors';
 import type { StructuredLogger } from '../observability/logger';
 import type { RuntimeMetrics } from '../observability/metrics';
-import type { AuditLogStore, ExceptionQueueStore, PendingActionStore } from '../stores/interfaces';
+import type { AuditLogStore, DealStateStore, ExceptionQueueStore, LeadStateStore, PendingActionStore } from '../stores/interfaces';
 import type { WorkflowEngine } from '../workflow/engine';
 import { bearerTokenMatches } from './auth';
 import type { RateLimiter } from './rate-limit';
@@ -18,10 +18,13 @@ import { errorMessage, readJsonBody, sendJson } from './respond';
  *
  * 路由：
  * - `GET  /workflows` / `GET /workflows/:id`：实例查询（含待审批动作，供审核界面取 action_id）
- * - `POST /workflows/:id/approve`：批准待审核动作并交给 Executor
+ * - `POST /workflows/:id/approve`：批准待审核动作并交给 Executor（动作已失效时改为重新规划）
  * - `POST /workflows/:id/reject`：拒绝并基于新约束重新规划
+ * - `POST /workflows/:id/replan`：作废待审动作，按当前事实重新规划（不做批准/拒绝的结论）
  * - `POST /workflows/:id/cancel`：取消实例
  * - `POST /workflows/:id/retry`：重试失败实例（分类与 submitted 规则由引擎判定）
+ * - `GET  /leads` / `GET /leads/:id`：销售读端点，按负责人/状态查看线索当前事实
+ * - `GET  /deals` / `GET /deals/:id`：销售读端点，按负责人/阶段/线索查看商机当前事实
  * - `GET  /audit`：只追加审计日志查询
  * - `GET  /exceptions` / `POST /exceptions/:id/resolve` / `POST /exceptions/:id/discard`
  *
@@ -33,6 +36,12 @@ export interface ControlPlaneDeps {
   readonly audit_log: AuditLogStore;
   readonly exception_queue: ExceptionQueueStore;
   readonly pending_action_store: PendingActionStore;
+  /**
+   * 销售读端点的数据来源：State 只存当前事实，`GET /leads` / `GET /deals`
+   * 直接读 Lead / Deal 的当前状态，不从事件流或 Workflow 实例反推。
+   */
+  readonly lead_store: LeadStateStore;
+  readonly deal_store: DealStateStore;
   readonly config: DealFlowConfig;
   readonly metrics?: RuntimeMetrics;
   /** 未识别异常的归宿：客户端只拿到通用文案，真实原因进日志。 */
@@ -80,9 +89,14 @@ const ROUTES: readonly Route[] = [
   { method: 'GET', pattern: /^\/workflows\/([^/]+)$/, handle: getWorkflow },
   { method: 'POST', pattern: /^\/workflows\/([^/]+)\/approve$/, handle: approve },
   { method: 'POST', pattern: /^\/workflows\/([^/]+)\/reject$/, handle: reject },
+  { method: 'POST', pattern: /^\/workflows\/([^/]+)\/replan$/, handle: replan },
   { method: 'POST', pattern: /^\/workflows\/([^/]+)\/cancel$/, handle: cancel },
   { method: 'POST', pattern: /^\/workflows\/([^/]+)\/retry$/, handle: retry },
   { method: 'POST', pattern: /^\/workflows\/([^/]+)\/reconcile$/, handle: reconcile },
+  { method: 'GET', pattern: /^\/leads$/, handle: listLeads },
+  { method: 'GET', pattern: /^\/leads\/([^/]+)$/, handle: getLead },
+  { method: 'GET', pattern: /^\/deals$/, handle: listDeals },
+  { method: 'GET', pattern: /^\/deals\/([^/]+)$/, handle: getDeal },
   { method: 'GET', pattern: /^\/audit$/, handle: listAudit },
   { method: 'GET', pattern: /^\/exceptions$/, handle: listExceptions },
   { method: 'POST', pattern: /^\/exceptions\/([^/]+)\/resolve$/, handle: resolveException },
@@ -217,6 +231,89 @@ function summarize(
   };
 }
 
+/**
+ * 销售读端点：线索与商机是销售每天要看的当前事实（谁负责、到哪一步、多少钱）。
+ *
+ * 过滤与分页在控制面内存里完成：这些是人发起的低频查询，不值得为它给 `StateStore`
+ * 增加按字段查询的接口；事件处理路径上的热读（`#context` 反查 Deal 阶段）仍然
+ * 走存储层索引，见 `stores/interfaces.ts` 的 `DealStateStore`。
+ */
+async function listLeads({ res, url, deps }: RouteContext): Promise<void> {
+  const owner = url.searchParams.get('owner_id');
+  const status = url.searchParams.get('status');
+  const paging = pagingFrom(url);
+
+  const matched = deps.lead_store.list().filter((lead) =>
+    (owner === null || lead.owner_id === owner) && (status === null || lead.status === status));
+
+  sendPage(res, deps, 'list_leads', matched, paging);
+}
+
+async function getLead({ res, params, deps }: RouteContext): Promise<void> {
+  const lead = deps.lead_store.get(params[0]!);
+  if (lead === undefined) {
+    sendJson(res, 404, { error: 'lead not found' });
+    return;
+  }
+
+  deps.metrics?.recordAction('get_lead');
+  sendJson(res, 200, lead);
+}
+
+async function listDeals({ res, url, deps }: RouteContext): Promise<void> {
+  const owner = url.searchParams.get('owner_id');
+  const stage = url.searchParams.get('stage');
+  const leadId = url.searchParams.get('lead_id');
+  const paging = pagingFrom(url);
+
+  const matched = deps.deal_store.list().filter((deal) =>
+    (owner === null || deal.owner_id === owner)
+    && (stage === null || deal.stage === stage)
+    && (leadId === null || deal.lead_id === leadId));
+
+  sendPage(res, deps, 'list_deals', matched, paging);
+}
+
+async function getDeal({ res, params, deps }: RouteContext): Promise<void> {
+  const deal = deps.deal_store.get(params[0]!);
+  if (deal === undefined) {
+    sendJson(res, 404, { error: 'deal not found' });
+    return;
+  }
+
+  deps.metrics?.recordAction('get_deal');
+  sendJson(res, 200, deal);
+}
+
+interface PageOptions {
+  readonly limit: number;
+  readonly offset: number;
+}
+
+function pagingFrom(url: URL): PageOptions {
+  return { limit: parseLimit(url.searchParams.get('limit')), offset: parseOffset(url.searchParams.get('offset')) };
+}
+
+/** 统一的列表响应：`total` 是过滤后的总数，`has_more` 按当前页是否还有下一条判断。 */
+function sendPage<T>(
+  res: ServerResponse,
+  deps: ControlPlaneDeps,
+  action: string,
+  rows: readonly T[],
+  paging: PageOptions,
+): void {
+  const page = rows.slice(paging.offset, paging.offset + paging.limit);
+  deps.metrics?.recordAction(action);
+  sendJson(res, 200, {
+    items: page,
+    count: page.length,
+    total: rows.length,
+    has_more: paging.offset + page.length < rows.length,
+    limit: paging.limit,
+    offset: paging.offset,
+  });
+}
+
 async function approve({ req, res, params, deps }: RouteContext): Promise<void> {
   const body = await readJsonBody(req, deps.config.webhook.max_body_bytes);
   if (!body.ok) {
@@ -226,10 +323,13 @@ async function approve({ req, res, params, deps }: RouteContext): Promise<void> 
 
   const actionId = requireString(body.value, 'action_id');
   const actorId = optionalString(body.value, 'actor_id') ?? 'control_plane';
-  const workflow = await deps.engine.approve(params[0]!, actionId, actorId);
+  const outcome = await deps.engine.approve(params[0]!, actionId, actorId);
 
   deps.metrics?.recordAction('approve');
-  sendJson(res, 200, summarize(workflow, deps));
+  sendJson(res, 200, {
+    ...summarize(outcome.workflow, deps),
+    stale_action_replanned: outcome.stale_action_replanned,
+  });
 }
 
 async function reject({ req, res, params, deps }: RouteContext): Promise<void> {
@@ -247,9 +347,25 @@ async function reject({ req, res, params, deps }: RouteContext): Promise<void> {
   }
 
   const actorId = optionalString(body.value, 'actor_id') ?? 'control_plane';
-  const workflow = await deps.engine.reject(params[0]!, actionId, actorId, reason);
+  const outcome = await deps.engine.reject(params[0]!, actionId, actorId, reason);
 
   deps.metrics?.recordAction('reject');
+  sendJson(res, 200, {
+    ...summarize(outcome.workflow, deps),
+    stale_action_replanned: outcome.stale_action_replanned,
+  });
+}
+
+async function replan({ req, res, params, deps }: RouteContext): Promise<void> {
+  const body = await readJsonBody(req, deps.config.webhook.max_body_bytes);
+  if (!body.ok) {
+    sendJson(res, body.status, { error: body.error });
+    return;
+  }
+
+  const workflow = await deps.engine.replan(params[0]!, optionalString(body.value, 'actor_id') ?? 'control_plane');
+
+  deps.metrics?.recordAction('replan');
   sendJson(res, 200, summarize(workflow, deps));
 }
 
@@ -442,4 +558,12 @@ function parseLimit(value: string | null): number {
     return DEFAULT_PAGE_LIMIT;
   }
   return Math.min(parsed, MAX_PAGE_LIMIT);
+}
+
+function parseOffset(value: string | null): number {
+  if (value === null) {
+    return 0;
+  }
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : 0;
 }
