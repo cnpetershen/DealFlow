@@ -322,3 +322,34 @@ describe('RuleBasedPolicyEvaluator 与 Decider 的边界', () => {
     expect(evaluate(action).decision).toBe('auto');
   });
 });
+describe('发送窗口支持跨零点', () => {
+  it('夜间静默窗口在窗口内时仍为 Auto', () => {
+    const context = decisionContext({
+      policy_context: policyContext({
+        evaluated_at: '2026-09-24T23:30:00+08:00',
+        send_window: { start_hour: 22, end_hour: 7 },
+      }),
+    });
+
+    expect(evaluate(proposedAction(), context).decision).toBe('auto');
+  });
+
+  it('夜间静默窗口在窗口外时转人工', () => {
+    const context = decisionContext({
+      policy_context: policyContext({
+        evaluated_at: '2026-09-24T12:00:00+08:00',
+        send_window: { start_hour: 22, end_hour: 7 },
+      }),
+    });
+
+    expectReview(proposedAction(), context, 'automation_limit_reached');
+  });
+
+  it('普通窗口在窗口外时转人工', () => {
+    const context = decisionContext({
+      policy_context: policyContext({ evaluated_at: '2026-09-24T23:30:00+08:00' }),
+    });
+
+    expectReview(proposedAction(), context, 'automation_limit_reached');
+  });
+});

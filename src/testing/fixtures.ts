@@ -68,6 +68,7 @@ export function auditEntryInput(overrides: Partial<NewAuditEntry> = {}): NewAudi
     subject: { subject_type: 'lead', subject_id: 'lead_1', workflow_instance_id: 'wf_1' },
     event_id: 'evt_0001',
     action_id: null,
+    action_type: null,
     before_state: null,
     after_state: 'new',
     reason: null,
@@ -76,6 +77,8 @@ export function auditEntryInput(overrides: Partial<NewAuditEntry> = {}): NewAudi
     source: 'crm',
     result: 'succeeded',
     provider_reference: null,
+    provider_receipt: null,
+    exception_id: null,
     ...overrides,
   };
 }
@@ -184,6 +187,9 @@ export function workflowState(
     failure_classification: null,
     failure_submitted: null,
     failure_retry_after: null,
+    failure_retry_attempts: 0,
+    failure_next_attempt_at: null,
+    previous_decisions: [],
     created_at: '2026-09-24T10:00:00+08:00',
     updated_at: '2026-09-24T10:00:00+08:00',
     ...overrides,
@@ -208,6 +214,9 @@ export function emailSentEvent(
       template_id: 'tpl_first_touch',
       workflow_instance_id: 'wf_lead_follow_up_lead_1',
       sent_at: '2026-09-24T10:30:00+08:00',
+      provider_reference: null,
+      provider: null,
+      correlation_id: null,
     },
     source: 'email_connector',
     ...overrides,
@@ -232,6 +241,9 @@ export function emailRepliedEvent(
       sentiment: 'positive',
       intent: 'ask_pricing',
       body_reference: 'raw_msg_reply_1',
+      provider_reference: null,
+      provider: null,
+      correlation_id: null,
     },
     source: 'email_connector',
     ...overrides,
@@ -257,14 +269,91 @@ export function proposalSentEvent(
       currency: 'CNY',
       document_reference: 'doc_rev_1',
       sent_at: '2026-09-24T15:00:00+08:00',
+      provider_reference: null,
+      provider: null,
+      correlation_id: null,
     },
     source: 'crm',
     ...overrides,
   } as ParsedEventOf<'proposal.sent'>;
 }
 
-export function contactState(overrides: Partial<ContactState> = {}): ContactState {
+export function meetingScheduledEvent(
+  overrides: EventOverrides<'meeting.scheduled'> = {},
+): ParsedEventOf<'meeting.scheduled'> {
   return {
+    event_id: 'evt_0008',
+    type: 'meeting.scheduled',
+    version: 1,
+    occurred_at: '2026-09-24T13:00:00+08:00',
+    idempotency_key: 'meeting.scheduled:mtg_1',
+    payload: {
+      meeting_id: 'mtg_1',
+      lead_id: 'lead_1',
+      contact_id: 'contact_1',
+      organizer_id: 'user_7',
+      scheduled_start_at: '2026-09-25T10:00:00+08:00',
+      scheduled_end_at: '2026-09-25T10:30:00+08:00',
+      calendar_provider: 'google',
+      status: 'scheduled',
+      provider_reference: null,
+      provider: null,
+      correlation_id: null,
+    },
+    source: 'calendar_connector',
+    ...overrides,
+  } as ParsedEventOf<'meeting.scheduled'>;
+}
+
+export function taskOverdueEvent(
+  overrides: EventOverrides<'task.overdue'> = {},
+): ParsedEventOf<'task.overdue'> {
+  return {
+    event_id: 'evt_0009',
+    type: 'task.overdue',
+    version: 1,
+    occurred_at: '2026-09-24T17:00:00+08:00',
+    idempotency_key: 'task.overdue:task_1',
+    payload: {
+      task_id: 'task_1',
+      lead_id: 'lead_1',
+      deal_id: null,
+      workflow_instance_id: 'wf_lead_follow_up_lead_1',
+      task_type: 'follow_up_email',
+      assigned_to: 'user_7',
+      due_at: '2026-09-24T09:00:00+08:00',
+      overdue_at: '2026-09-24T17:00:00+08:00',
+    },
+    source: 'task_connector',
+    ...overrides,
+  } as ParsedEventOf<'task.overdue'>;
+}
+
+export function contactRecordedEvent(
+  overrides: EventOverrides<'contact.recorded'> = {},
+): ParsedEventOf<'contact.recorded'> {
+  return {
+    event_id: 'evt_0010',
+    type: 'contact.recorded',
+    version: 1,
+    occurred_at: '2026-09-24T10:30:00+08:00',
+    idempotency_key: 'contact.recorded:crm:contact_1',
+    payload: {
+      contact_id: 'contact_1',
+      lead_id: 'lead_1',
+      full_name: 'Zhang San',
+      email: 'buyer@acme.example',
+      organization_id: 'org_acme',
+      contact_preference: 'auto_allowed',
+      contactability: 'reachable',
+      is_new_contact: false,
+    },
+    source: 'crm',
+    ...overrides,
+  } as ParsedEventOf<'contact.recorded'>;
+}
+
+export function contactState(overrides: Partial<ContactState> = {}): ContactState {  return {
     contact_id: 'contact_1',
     full_name: 'Zhang San',
     email: 'buyer@acme.example',

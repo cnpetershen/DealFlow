@@ -108,12 +108,46 @@ export class SqliteEventStore implements ClaimableEventStore {
     return row === undefined ? undefined : this.#toStoredEvent(row);
   }
 
+  /**
+   * 走 `idx_events_event_id` 表达式索引：重试路径按事件 id 取回单条，
+   * 而不是把整本事件日志读进内存再 `find`（事件只增不减，退化是必然的）。
+   */
+  getByEventId(eventId: string): StoredEvent | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT sequence, idempotency_key, event, processing_status
+         FROM events
+         WHERE json_extract(event, '$.event_id') = ?
+         ORDER BY sequence
+         LIMIT 1`,
+      )
+      .get(eventId) as EventRow | undefined;
+    return row === undefined ? undefined : this.#toStoredEvent(row);
+  }
+
   list(): readonly StoredEvent[] {
     const rows = this.#db
       .prepare(
         'SELECT sequence, idempotency_key, event, processing_status FROM events ORDER BY sequence',
       )
       .all() as unknown as EventRow[];
+    return rows.map((row) => this.#toStoredEvent(row));
+  }
+
+  /**
+   * 走 `idx_events_lead` 表达式索引，只读取该 Lead 的最近 limit 条事件。
+   * 见 `EventStore.listByLeadId` 的说明：这是避免处理耗时随事件总量线性增长的关键。
+   */
+  listByLeadId(leadId: string, limit: number): readonly StoredEvent[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT sequence, idempotency_key, event, processing_status
+         FROM events
+         WHERE json_extract(event, '$.payload.lead_id') = ?
+         ORDER BY sequence DESC
+         LIMIT ?`,
+      )
+      .all(leadId, limit) as unknown as EventRow[];
     return rows.map((row) => this.#toStoredEvent(row));
   }
 

@@ -6,3 +6,10 @@ coverage/
 .env.*
 !.env.example
 .DS_Store
+# 文档配图的本地渲染工具（mermaid-cli + 浏览器），不是运行时依赖
+.diagram-tools/
+# 本地 SQLite 业务库与备份
+data/
+*.db
+*.db-wal
+*.db-shm

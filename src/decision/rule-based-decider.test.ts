@@ -7,6 +7,7 @@ import {
   emailRepliedEvent,
   emailSentEvent,
   leadState,
+  meetingScheduledEvent,
   policyContext,
   proposalSentEvent,
   workflowState,
@@ -179,6 +180,9 @@ describe('RuleBasedDecider 互动与推进', () => {
                 scheduled_end_at: '2026-09-25T14:30:00+08:00',
                 calendar_provider: 'feishu',
                 status: 'confirmed',
+                provider_reference: null,
+                provider: null,
+                correlation_id: null,
               },
             },
           ],
@@ -213,6 +217,39 @@ describe('RuleBasedDecider 互动与推进', () => {
         }),
       ),
     ).toEqual([]);
+  });
+
+  it('Lead 尚未发生有效互动时，Deal 阶段推进不抢先于邮件与会议流程', () => {
+    // CRM 可能先建立 Deal；此时应优先走首次跟进邮件，而不是把阶段推进塞进人工审核。
+    const early = decisionContext({
+      lead_state: leadState({ status: 'assigned', owner_id: 'user_7' }),
+      deal_state: dealState({ stage: 'qualification' }),
+      recent_events: [],
+    });
+
+    expect(only(early).action_type).toBe('send_email');
+
+    // 首次跟进邮件已发出后，Lead 仍停在 assigned：既不重复发邮件，也不抢先推进 Deal。
+    expect(
+      decide(
+        decisionContext({
+          lead_state: leadState({ status: 'assigned', owner_id: 'user_7' }),
+          deal_state: dealState({ stage: 'qualification' }),
+          recent_events: [emailSentEvent()],
+        }),
+      ),
+    ).toEqual([]);
+
+    // 已发生有效互动后，阶段推进才成为候选动作。
+    expect(
+      only(
+        decisionContext({
+          lead_state: leadState({ status: 'engaged', owner_id: 'user_7' }),
+          deal_state: dealState({ stage: 'qualification' }),
+          recent_events: [emailSentEvent(), emailRepliedEvent(), meetingScheduledEvent()],
+        }),
+      ).action_type,
+    ).toBe('advance_deal_stage');
   });
 
   it('Deal 处于发现或提案阶段且配置齐备时提出方案发送', () => {

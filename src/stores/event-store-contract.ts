@@ -187,5 +187,16 @@ export function describeEventStoreContract(
 
       expect(store.list()).toHaveLength(1);
     });
+
+    it('getByEventId returns the stored event, undefined for unknown ids', () => {
+      setup();
+      store.append(leadCreatedEvent());
+      store.append(leadAssignedEvent());
+
+      expect(store.getByEventId('evt_0002')?.event.type).toBe('lead.assigned');
+      expect(store.getByEventId('evt_0001')?.event.idempotency_key).toBe('lead.created:crm:rec_1001');
+      expect(store.getByEventId('evt_unknown')).toBeUndefined();
+      expect(store.getByEventId('')).toBeUndefined();
+    });
   });
 }

@@ -71,6 +71,26 @@ describe('InMemoryStateStore', () => {
 
     expect(store.list()).toHaveLength(1);
   });
+
+  it('listByLeadId 只返回带该 lead_id 的记录，且与 list() 插入序一致', () => {
+    const store = new InMemoryStateStore((state: ReturnType<typeof dealState>) => state.deal_id);
+    store.save(dealState());
+    store.save(dealState({ deal_id: 'deal_2', lead_id: 'lead_2' }));
+    store.save(dealState({ deal_id: 'deal_3', lead_id: 'lead_1' }));
+
+    expect(store.listByLeadId('lead_1').map((deal) => deal.deal_id)).toEqual(['deal_1', 'deal_3']);
+    expect(store.listByLeadId('lead_missing')).toEqual([]);
+    expect(store.list()).toHaveLength(3);
+  });
+
+  it('没有 lead_id 字段的实体类型恒返回空，而不是抛错', () => {
+    const workflows = new InMemoryStateStore(
+      (state: ReturnType<typeof workflowState>) => state.workflow_instance_id,
+    );
+    workflows.save(workflowState());
+
+    expect(workflows.listByLeadId('lead_1')).toEqual([]);
+  });
 });
 
 describe('InMemoryWorkflowStateStore', () => {

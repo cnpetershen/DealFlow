@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 import { DEAL_STAGES } from '../state-machine/states';
+import { CONTACTABILITIES, CONTACT_PREFERENCES } from '../stores/types';
 import { eventEnvelopeSchema, type EventEnvelope } from './envelope';
 
 /**
@@ -13,6 +14,17 @@ const occurredAt = z.string().datetime({ offset: true });
 
 /** Deal 阶段，对应 docs/state-machine.md「Deal Stage」。状态定义以 state-machine/states 为唯一来源。 */
 export const dealStageSchema = z.enum(DEAL_STAGES);
+
+/**
+ * Result Event 契约的对账字段，对应 docs/events.md「Result Event 契约」。
+ * 由提供商 webhook 驱动的结果事件（email.sent / email.replied / meeting.scheduled / proposal.sent）
+ * 在提供商可用时必须提供；缺失时为 null，并允许进入异常队列做人工对账。
+ */
+const resultEventReceipt = {
+  provider_reference: identifier.nullable(),
+  provider: identifier.nullable(),
+  correlation_id: identifier.nullable(),
+};
 
 export const leadCreatedV1 = z.object({
   lead_id: identifier,
@@ -42,6 +54,25 @@ export const dealCreatedV1 = z.object({
   source_record_id: identifier,
 });
 
+/**
+ * Contact 当前事实的写入事件。
+ *
+ * Contact 是独立于 Workflow 的主体（docs/domain.md「Contact」），因此：
+ * - `lead_id` 可为空：联系人可以在尚未关联 Lead 时先被登记；
+ * - 这是**事实类事件**，任何 Workflow 状态下都会合并进 State，不会被等待条件挡住；
+ * - `is_new_contact` 由来源系统声明：它决定 Policy 是否要求「新联系人的外部沟通必须人工审核」。
+ */
+export const contactRecordedV1 = z.object({
+  contact_id: identifier,
+  lead_id: identifier.nullable(),
+  full_name: identifier.nullable(),
+  email: z.string().email().nullable(),
+  organization_id: identifier.nullable(),
+  contact_preference: z.enum(CONTACT_PREFERENCES),
+  contactability: z.enum(CONTACTABILITIES),
+  is_new_contact: z.boolean(),
+});
+
 export const emailSentV1 = z.object({
   message_id: identifier,
   lead_id: identifier,
@@ -51,6 +82,7 @@ export const emailSentV1 = z.object({
   template_id: identifier.nullable(),
   workflow_instance_id: identifier.nullable(),
   sent_at: occurredAt,
+  ...resultEventReceipt,
 });
 
 export const emailRepliedV1 = z.object({
@@ -62,6 +94,7 @@ export const emailRepliedV1 = z.object({
   sentiment: identifier.nullable(),
   intent: identifier.nullable(),
   body_reference: identifier,
+  ...resultEventReceipt,
 });
 
 export const meetingScheduledV1 = z.object({
@@ -73,6 +106,7 @@ export const meetingScheduledV1 = z.object({
   scheduled_end_at: occurredAt,
   calendar_provider: identifier,
   status: identifier,
+  ...resultEventReceipt,
 });
 
 export const proposalSentV1 = z.object({
@@ -85,6 +119,7 @@ export const proposalSentV1 = z.object({
   currency: identifier.nullable(),
   document_reference: identifier,
   sent_at: occurredAt,
+  ...resultEventReceipt,
 });
 
 export const dealStageChangedV1 = z.object({
@@ -115,6 +150,7 @@ export const taskOverdueV1 = z
 export interface EventPayloadMap {
   'lead.created': z.infer<typeof leadCreatedV1>;
   'lead.assigned': z.infer<typeof leadAssignedV1>;
+  'contact.recorded': z.infer<typeof contactRecordedV1>;
   'deal.created': z.infer<typeof dealCreatedV1>;
   'email.sent': z.infer<typeof emailSentV1>;
   'email.replied': z.infer<typeof emailRepliedV1>;
@@ -131,6 +167,7 @@ export type EventPayload<T extends EventType> = EventPayloadMap[T];
 export const eventPayloadSchemas: { [T in EventType]: Record<number, z.ZodTypeAny> } = {
   'lead.created': { 1: leadCreatedV1 },
   'lead.assigned': { 1: leadAssignedV1 },
+  'contact.recorded': { 1: contactRecordedV1 },
   'deal.created': { 1: dealCreatedV1 },
   'email.sent': { 1: emailSentV1 },
   'email.replied': { 1: emailRepliedV1 },
@@ -159,6 +196,21 @@ export class UnsupportedEventVersionError extends Error {
 
 export function isEventType(value: string): value is EventType {
   return Object.prototype.hasOwnProperty.call(eventPayloadSchemas, value);
+}
+
+/**
+ * 事实类事件：描述业务对象「当前事实」的入口事件，不是任何动作的执行结果。
+ *
+ * 它们在 Workflow 的任何状态下都必须被合并进 State：
+ * 否则 Deal / Contact 会因为「不匹配当前等待条件」而被整条丢弃，
+ * 导致业务事实只能在某个恰好匹配的时刻才能落库。
+ */
+export const FACT_ONLY_EVENT_TYPES = ['lead.created', 'contact.recorded', 'deal.created'] as const;
+
+export type FactOnlyEventType = (typeof FACT_ONLY_EVENT_TYPES)[number];
+
+export function isFactOnlyEvent(type: EventType): boolean {
+  return (FACT_ONLY_EVENT_TYPES as readonly string[]).includes(type);
 }
 
 export function getEventPayloadSchema(type: string, version: number): z.ZodTypeAny {

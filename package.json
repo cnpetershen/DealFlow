@@ -5,9 +5,15 @@
   "type": "module",
   "description": "Event-driven, human-in-the-loop sales workflow engine",
   "scripts": {
+    "dev": "node --disable-warning=ExperimentalWarning --env-file-if-exists=.env --experimental-transform-types --import ./scripts/register.mjs --watch src/main.ts",
+    "start": "node --disable-warning=ExperimentalWarning --env-file-if-exists=.env --experimental-transform-types --import ./scripts/register.mjs src/main.ts",
+    "backup": "node --disable-warning=ExperimentalWarning --env-file-if-exists=.env --experimental-transform-types --import ./scripts/register.mjs src/tools/backup.ts",
     "test": "vitest",
     "test:run": "vitest run",
     "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22.22.0"
   },
   "dependencies": {
     "zod": "^3.23.8"

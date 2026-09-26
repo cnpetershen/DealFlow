@@ -136,3 +136,19 @@ Policy 固定按 `Reject` → `Human Review` → `Auto` 判定：
 ### Decision 的动作元数据
 
 动作类型的风险等级、有效期、是否属于对外沟通、是否涉及商业条款集中定义在 `ACTION_METADATA`，是 Decision 与 Policy 共用的唯一来源。Decider 只按规则产出建议，`action_id` 与执行幂等 key 由 Decider 统一生成；注入固定生成器即可让同一 Context 的决策完全可复现。
+
+### 规则之间的优先级约束
+
+规则按优先级取第一个能产出动作的规则（`DECISION_RULES`）。为避免「先建立的 Deal」压住 Lead 侧的互动流程，`qualificationAdvanceRule` 额外要求 Lead 已发生有效互动：
+
+- Lead 处于 `new` / `assigned` 时，即使 CRM 已经建立了 Deal，也**不**提出阶段推进。`deal.created` 是事实类事件，任何时刻都会落库，若此时就推进阶段，会立刻产生一条人工审核并阻塞首次跟进邮件与会议。
+- Lead 进入 `engaged` / `qualified` / `converted` 后，阶段推进才成为候选动作（对应状态机 `qualified` + `deal.created` → `converted`）。
+
+对应实现与回归用例：`src/decision/rule-based-decider.ts`、`src/decision/rule-based-decider.test.ts`。
+
+### 批准时的复核
+
+`Approved` 的第 2 条由引擎在批准时执行：重新构造 Context 并让 Policy 再判一次，命中任一硬性禁止项
+（`action_expired`、`stale_plan_version`、`terminal_subject`、`unsubscribed_contact`、`unauthorized_action`、
+`missing_idempotency_key`、`already_executed`）就拒绝执行该动作，要求人工重新规划。
+审批入口开放在控制面上，不能假设审核人一定看得到最新 State。

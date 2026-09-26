@@ -56,6 +56,7 @@
 | Deal 任意非终态 | `deal.stage_changed` | `to_stage = lost` | `lost` | 终止自动动作，保留丢单原因 |
 | Workflow `pending` | 启动 | 依赖数据就绪 | `running` | 进入首个可执行步骤 |
 | Workflow `running` | 派发动作 | 动作已交给 Executor 且需等待外部结果 | `waiting_result` | 记录等待条件与执行幂等 key |
+| Workflow `running` | 无可执行动作 | 当前无动作可提，但主体仍可被后续事件推进 | `waiting_result` | 按当前 State 推导等待事件集合并休眠（触发器 `awaiting_events`） |
 | Workflow `running` | 需要人工审核 | Policy 判定为 Human Review | `needs_review` | 生成待审核 ProposedAction，不直接执行 |
 | Workflow `running` | 无法处理 | 可重试错误 | `failed` | 保留失败原因，按重试策略恢复 |
 | Workflow `running` | 流程结束 | 无后续步骤且无待办 | `completed` | 结束自动动作，写入审计记录 |
@@ -64,14 +65,36 @@
 | Workflow `needs_review` | 人工拒绝 | ProposedAction 被拒绝 | `replanning` | 记录拒绝原因，基于新约束重新规划 |
 | Workflow `replanning` | 规划完成 | 已生成新的 `plan_version`，或确认无安全替代动作 | `running` / `waiting_result` / `needs_review` | 进入新计划的首个可执行步骤，或转为等待、人工审核 |
 | Workflow `replanning` | 流程结束 | 无后续步骤且无待办 | `completed` | 结束自动动作，写入审计记录 |
-| Workflow `failed` | 重试 | `transient` 且 `submitted !== 'unknown'` | `running` | 复用同一 `idempotency_key` 重试 |
+| Workflow `failed` | 重试 | `transient` 且 `submitted !== 'unknown'` | `running` | 复用同一 `idempotency_key` 重试（可由 `RetryScheduler` 自动触发，见 `docs/deployment.md` 第 5.2 节） |
 | Workflow `failed` | 重试 | `permanent` 失败 | 保持 `failed` | 拒绝自动重试，需人工处理或修正输入 |
 | Workflow `failed` | 重试 | `submitted === 'unknown'`（可能已提交） | 保持 `failed` | 拒绝简单自动重试，先做 provider 对账 |
+| Workflow `failed` | Provider 对账 | 对账确认**已提交** | `waiting_result` | 恢复为「已派发、等待结果」，不再调用外部（`action_reconciled` 审计，见 `docs/deployment.md` 5.3） |
+| Workflow `failed` | Provider 对账 | 对账确认**未提交** | `running` | 用**原执行幂等 key** 重新派发，不产生第二次副作用 |
+| Workflow `failed` | Provider 对账 | 对账返回 `unknown` 或对账请求失败 | 保持 `failed` | 写入异常队列转人工，禁止猜测后重试 |
 | Workflow 任意非终态 | 取消操作 | 明确取消 | `cancelled` | 不再自动执行未批准动作 |
 
 表中的 Lead 和 Deal 状态必须通过受控的事件处理更新。没有对应事件或违反阶段规则的状态写入应被拒绝并进入异常处理。
 
 Workflow 的触发器与 Lead/Deal 不同：它既可以是外部事件（例如 `waiting_result` 匹配到的结果事件），也可以是控制面操作（启动、派发动作、需要人工审核、人工批准、人工拒绝、规划完成、重试、流程结束、取消）。控制面操作不是 Event，不受 `idempotency_key` 去重约束，但同样必须追加 Audit Log。
+
+## 无动作时的落点：推导等待，而不是结束流程
+
+Decider 暂时提不出动作时，Workflow **不能**直接 `completed`：Lead 侧互动（邮件、回复、会议）与 Deal 侧生命周期（阶段推进、成交/丢单）是同一实例里的连续过程，提前结束会让后续事件全部变成 `unmatched_event`。
+
+引擎按以下规则决定落点（实现见 `src/workflow/expected-events.ts`）：
+
+1. 由当前 Lead 状态与 Deal 阶段推导「还能推进流程的事件集合」，写入 `awaiting_event_types`，`current_step = 'await_event'`，进入 `waiting_result` 休眠；
+2. 已经发生过且不会重复的事件（`deal.created`、`email.sent` 等）从集合中剔除，避免等待一个永远不会再来的事件；
+3. 只有主体已进入终态（Lead `disqualified`/`closed`、Deal `won`/`lost`）导致集合为空时，才迁移到 `completed`。
+
+两类等待必须区分，`current_step` 是判定依据：
+
+| 等待类型 | `current_step` | `awaiting_event_types` | 事实类事件能否触发重新规划 |
+| --- | --- | --- | --- |
+| 派发动作后等结果 | 动作类型（如 `send_email`） | 该动作的结果事件（`RESULT_EVENTS`） | 否（避免动作在途时重复派发） |
+| 推导等待 | `await_event` | 推导出的可推进事件集合 | 是（此时没有动作在途） |
+
+`needs_review` 期间到达的非事实类事件：合并可安全合并的事实，写入异常队列（`invalid_transition`），但不擅自推进 Workflow —— 既不静默覆盖，也不静默丢弃。
 
 ## Workflow Resume 规则
 
@@ -86,3 +109,9 @@ Workflow 的触发器与 Lead/Deal 不同：它既可以是外部事件（例如
 9. **终态保护**：Lead 已 `disqualified`/`closed` 或 Deal 已 `won`/`lost` 后，默认不再自动恢复原 Workflow；新事实只能产生明确的后续流程或人工审核。
 10. **审计先行**：状态迁移、Decision、Policy 结论、人工操作和执行结果均追加 Audit Log，Audit Log 不可修改。
 11. **崩溃恢复重放**：EventStore 中的事件是恢复的唯一事实来源。重启后对空 State Store 调用 `recoverFromEventLog()`，按 `sequence` 重放全部事件重建 State；`pending` 事件完整处理并 `markProcessed`，已处理事件幂等重放。事件仍为 `pending` 且 Workflow 已是 `failed` 时，重投事件按 `retry` 语义先恢复 `running` 再规划。多 worker 并发时通过事件处理租约（claim lease）保证同一 `idempotency_key` 同一时刻仅一个 worker 处理。
+
+    入口由 `Application.recoverOnStart()` 执行（`src/app/bootstrap.ts`），在**开始监听之前**完成：
+    State Store 为空而事件日志非空时重放全部事件；否则只重投仍为 `pending` 的事件（复用同一 `idempotency_key`）；
+    已经有未处理异常的事件不再自动重投，避免每次启动都刷一条异常，交给人工通过控制面处理。
+
+    **恢复不盲目调用外部 Executor**：外部副作用（发邮件、建会议、发方案等）无法幂等重放，因此重放期间不调用 `Executor.execute`。重放只按确定性 Decision + Policy 重建「已派发、等待结果（`waiting_result`）」状态，并写入 `action_dispatched` 审计；真实副作用交由结果事件确认或 provider 对账，绝不重放第二次。执行失败的 `failure_*` 字段持久化在 WorkflowInstanceState（而非事件日志），仅在 State Store 未清空时跨重启保留。

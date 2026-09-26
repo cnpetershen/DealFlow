@@ -17,6 +17,35 @@ MVP 以一个 Lead 的单一销售跟进 Workflow 为范围，必须能够完成
 11. Store、Executor 和外部事件来源均通过接口定义，MVP 提供 InMemory 实现用于测试。
 12. 服务重启或重复消费后，不能重复发送邮件、重复创建任务、重复推进阶段或创建第二个 WorkflowInstance。
 
+## 依赖的外部事件与入口
+
+以下事实必须由事件声明，引擎不会猜测（见 `docs/events.md`）：
+
+| 事实 | 事件 | 缺失后果 |
+| --- | --- | --- |
+| 联系人邮箱与联系偏好 | `contact.recorded` | 没有邮箱时 Decider 不提出 `send_email`，Workflow 停在等待状态而不是编造收件人 |
+| Deal 建立与阶段 | `deal.created` / `deal.stage_changed` | 由 CRM 提供；缺失时 Deal 侧规则不触发 |
+| 人工审批 | 控制面 `POST /workflows/{id}/approve|reject`（`docs/deployment.md` 第 5 节） | `needs_review` 的实例无法推进 |
+| 不确定提交的对账 | 控制面 `POST /workflows/{id}/reconcile`（第 5.3 节） | `submitted === 'unknown'` 的实例既不能重试、也无法恢复 |
+| 异常处理与重放 | 控制面 `POST /exceptions/{id}/resolve|discard|replay`（第 5.4 节） | 未匹配/冲突的事件只能线下处理 |
+
+## 已知取舍
+
+- `needs_review` 期间到达的非事实类事件（如外部 `deal.stage_changed`）会合并事实并写入异常队列，
+  但不会自动推进 Workflow：需要人工先完成审批，或通过控制面处理异常后重投。
+- 未被任何 Workflow 认领的事件保持 `pending`（不标记已处理），以便补建 Workflow 后通过
+  `replay` 接回正常路径；同一事件已有未处理异常时不会重复入队。
+- 派发动作失败时 HTTP 仍返回 `processed`（事件事实确实已被处理、审计已写入），
+  但实例会落到 `failed`；调用方应以 `GET /workflows/{id}` 的实例状态为准，而不是只看接收响应。
+- 控制面是内部运维接口，不做 HMAC 签名；必须配置 Token，并限制在内网可达。
+- 单实例部署：限流与重放缓存是进程内状态，SQLite 同一时刻只允许一个写事务。
+  多实例需要在入口网关做限流/去重，且不要多个进程写同一个库文件。
+- 运行在实验性能力上：`--experimental-transform-types` 与 `node:sqlite`（Node 22 标记为 experimental）。
+  升级 Node 必须回归 `src/stores` 全部测试。
+- 事件与审计只追加、无归档策略，会持续增长。查询路径已索引化（见 `docs/runtime.md`），
+  但长期运行仍应规划归档与保留周期。
+- 尚无告警规则：`/metrics` 提供 `open_exceptions`、`workflows_by_status` 等 gauge 供外部告警系统采集。
+
 ## 测试用例列表
 
 ### 1. 重复事件
@@ -61,3 +90,5 @@ MVP 以一个 Lead 的单一销售跟进 Workflow 为范围，必须能够完成
 - 不存在的 WorkflowInstance 只能在允许创建的入口事件上创建，不能因任意结果事件凭空创建流程。
 - Workflow 失败后重试使用同一事件幂等 key，并且不会产生重复业务效果。
 - 所有 InMemory Store 和 Executor 测试都覆盖成功、重复、冲突、失败和人工介入路径。
+
+Webhook 响应层语义：`event_status` 表示事件处理结果，`workflow_status` 表示关联 Workflow 当前状态；派发失败仍返回 HTTP `200`、`event_status=processed`，但 `workflow_status=failed`。

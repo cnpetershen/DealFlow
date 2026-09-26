@@ -314,14 +314,25 @@ function highRiskStageAdvanceTarget(action: ProposedAction): string | null {
   return (HIGH_RISK_STAGE_ADVANCE_TARGETS as readonly string[]).includes(toStage) ? toStage : null;
 }
 
-/** 按业务时区判定是否处于允许发送窗口内，避免依赖服务器本地时区。 */
+/**
+ * 按业务时区判定是否处于允许发送窗口内，避免依赖服务器本地时区。
+ *
+ * `start_hour >= end_hour` 是**跨零点窗口**（例如夜间静默 22:00-07:00，以及 `start === end`
+ * 的全天窗口），按「≥ 起点 或 < 终点」判定；否则按普通的「≥ 起点 且 < 终点」判定。
+ * 少了跨零点分支时起点永远大于终点、条件恒为假，夜间的静默窗口会被判成
+ * 「永远不在窗口内」，所有对外沟通一律被转人工。
+ */
 function isWithinSendWindow(context: DecisionContext): boolean {
   const { evaluated_at: evaluatedAt, business_timezone_offset_minutes: offsetMinutes, send_window: window } =
     context.policy_context;
 
   const localHour = new Date(Date.parse(evaluatedAt) + offsetMinutes * 60_000).getUTCHours();
 
-  return localHour >= window.start_hour && localHour < window.end_hour;
+  if (window.start_hour < window.end_hour) {
+    return localHour >= window.start_hour && localHour < window.end_hour;
+  }
+
+  return localHour >= window.start_hour || localHour < window.end_hour;
 }
 
 /**

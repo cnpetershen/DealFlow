@@ -76,4 +76,23 @@ describe('InMemoryExceptionQueue', () => {
 
     expect(queue.list()).toHaveLength(1);
   });
+
+  it('list / listOpen supports status and limit/offset push-down', () => {
+    queue.enqueue(exceptionInput());
+    queue.enqueue(exceptionInput({ reason: 'idempotency_conflict' }));
+    const third = queue.enqueue(exceptionInput({ reason: 'unmatched_event' }));
+    queue.resolve(third.exception_id, 'resolved manually');
+
+    expect(queue.count()).toBe(3);
+    expect(queue.count('open')).toBe(2);
+    expect(queue.count('resolved')).toBe(1);
+
+    expect(queue.list({ limit: 2 })).toHaveLength(2);
+    expect(queue.list({ limit: 2, offset: 2 }).map((r) => r.exception_id)).toEqual(['exc_3']);
+    expect(queue.list({ status: 'open' })).toHaveLength(2);
+    expect(queue.list({ status: 'resolved' }).map((r) => r.exception_id)).toEqual(['exc_3']);
+    expect(queue.listOpen({ limit: 1 })).toHaveLength(1);
+    expect(queue.listOpen()).toHaveLength(2);
+    expect(queue.list()).toHaveLength(3);
+  });
 });

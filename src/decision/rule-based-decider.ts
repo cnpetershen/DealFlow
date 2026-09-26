@@ -1,5 +1,11 @@
 import type { EventType } from '../events/dictionary';
-import { isDealTerminal, isLeadTerminal, isWorkflowTerminal, type WorkflowStatus } from '../state-machine/states';
+import {
+  isDealTerminal,
+  isLeadTerminal,
+  isWorkflowTerminal,
+  type LeadStatus,
+  type WorkflowStatus,
+} from '../state-machine/states';
 import { deepFreezeClone } from '../stores/shared';
 import type { DecisionContext } from './context';
 import type { Decider } from './interfaces';
@@ -17,6 +23,14 @@ import { ACTION_METADATA, type ActionType, type ProposedAction, type ProposedAct
 
 /** 允许提出动作的 Workflow 状态；等待结果或待审核时不重复规划。 */
 const DECIDABLE_WORKFLOW_STATUSES: readonly WorkflowStatus[] = ['running', 'replanning'];
+
+/**
+ * 尚未发生有效互动的 Lead 状态。
+ * Deal 可能先于互动被 CRM 建立（`deal.created` 是事实类事件，任何时刻都会落库），
+ * 但此时「资格确认已完成」不成立：应继续走邮件与会议流程，
+ * 阶段推进留到 Lead 真正 engaged / qualified 之后再提出。
+ */
+const EARLY_LEAD_STATUSES: readonly LeadStatus[] = ['new', 'assigned'];
 
 type DecisionRule = (context: DecisionContext) => readonly ProposedActionDraft[];
 
@@ -241,6 +255,11 @@ function qualificationAdvanceRule(context: DecisionContext): readonly ProposedAc
   const deal = context.deal_state;
 
   if (deal === null || deal.stage !== 'qualification') {
+    return [];
+  }
+
+  const lead = context.lead_state;
+  if (lead !== null && EARLY_LEAD_STATUSES.includes(lead.status)) {
     return [];
   }
 

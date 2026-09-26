@@ -145,7 +145,8 @@ describe('Crash Recovery', () => {
       status: 'waiting_result',
       awaiting_event_types: ['email.sent'],
     });
-    expect(rebooted.executor.attempts()).toHaveLength(1);
+    // 崩溃恢复不盲目调用外部 Executor：状态重建为「已派发等待结果」，但不再发起第二次外部副作用。
+    expect(rebooted.executor.attempts()).toHaveLength(0);
     expect(rebooted.audit.list().some((e) => e.action === 'action_dispatched')).toBe(true);
   });
 
@@ -161,6 +162,8 @@ describe('Crash Recovery', () => {
       list: () => stack.audit.list(),
       listByEventId: (id) => stack.audit.listByEventId(id),
       listByActionId: (id) => stack.audit.listByActionId(id),
+      query: (filter) => stack.audit.query(filter),
+      count: (filter) => stack.audit.count(filter),
     };
 
     const leads = new InMemoryStateStore<LeadState>((s) => s.lead_id);

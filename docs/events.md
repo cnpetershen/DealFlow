@@ -16,6 +16,14 @@
 
 事件处理器以 `idempotency_key` 去重，并保留已经处理过的 key。重复事件不得重复推进 State、重复创建任务或重复写入执行结果。
 
+## 事实类事件（Fact-only）
+
+`lead.created`、`contact.recorded`、`deal.created` 描述**业务对象当前事实**，不是任何动作的执行结果（原因见 `src/events/dictionary.ts` 的 `FACT_ONLY_EVENT_TYPES`）。引擎对它们的处理规则与其他事件不同：
+
+1. Workflow 处于**任何**状态（含 `waiting_result`、`needs_review`、`completed`）时都会被合并进 State，不会因为「不匹配当前等待条件」被整条丢弃；
+2. 尚无 Workflow 时也会落库，并返回 `processed` 而不是 `unmatched`：Contact / Deal 是独立于流程的主体；
+3. 只更新 State，不消费等待条件、不重新规划，因此不会在动作在途时重复派发；唯一例外是它**命中了推导出的等待集合**（例如 Lead 已 `qualified` 而在等待 `deal.created`），此时按正常事件重新规划。
+
 ## 事件字典
 
 ### `lead.created`
@@ -100,6 +108,25 @@
   - `sent_at`
 - `idempotency_key`: `proposal.sent:{provider}:{proposal_id}:{revision}`
 - 来源：报价/合同系统、文档发送服务或 CRM。
+
+### `contact.recorded`
+
+- `event_type`: `contact.recorded`
+- `version`: `1`
+- `payload`:
+  - `contact_id`: 联系人标识
+  - `lead_id`: 关联 Lead，可为空（联系人可以先于 Lead 被登记）
+  - `full_name`: 姓名，可为空
+  - `email`: 邮箱，可为空。**首次跟进邮件等外发动作依赖它**：没有邮箱时 Decider 不会编造收件人，只会进入等待
+  - `organization_id`: 所属组织，可为空
+  - `contact_preference`: `auto_allowed` 或 `human_only`
+  - `contactability`: `reachable` 或 `unsubscribed`
+  - `is_new_contact`: 是否尚无历史互动。为 `true` 时 Policy 会把对外沟通转人工审核
+- `idempotency_key`: `contact.recorded:{source}:{contact_id}:{revision}`
+- 来源：CRM 或联系人主数据连接器。
+
+`lead.created` 只带 `contact_id`；联系人的邮箱、联系偏好与可联系状态必须由本事件声明，
+不能由引擎按默认值猜测。引擎在合并时会补齐 `Lead.contact_id → Contact` 的关联（仅在缺失时）。
 
 ### `deal.created`
 

@@ -3,8 +3,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { auditEntryInput, dealState, exceptionInput, leadState, workflowState } from '../testing/fixtures';
+import { auditEntryInput, dealState, exceptionInput, leadCreatedEvent, leadState, workflowState } from '../testing/fixtures';
 import { openSqlite, type SqliteDatabase } from './sqlite-db';
+import { SqliteEventStore } from './sqlite';
 import {
   SqliteAuditLog,
   SqliteExceptionQueue,
@@ -12,7 +13,7 @@ import {
   SqliteWorkflowStateStore,
 } from './sqlite-stores';
 import { ExceptionNotFoundError, WorkflowBusinessKeyConflictError } from './interfaces';
-import { workflowBusinessKey } from './types';
+import { workflowBusinessKey, type DealState, type LeadState } from './types';
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -196,6 +197,130 @@ describe('SqliteStateStore', () => {
     leads.save(leadState({ status: 'assigned', owner_id: 'user_7' }));
     expect(leads.get('lead_1')).toMatchObject({ status: 'assigned', owner_id: 'user_7' });
     expect(leads.list()).toHaveLength(1);
+  });
+});
+
+describe('按 JSON 字段的点查', () => {
+  it('Deal 按 lead_id 反查只返回该线索的记录，顺序与 list() 一致', () => {
+    const sqlite = tempDb();
+    const deals = new SqliteStateStore<DealState>('deal', (s) => s.deal_id, { sqlite });
+
+    deals.save(dealState());
+    deals.save(dealState({ deal_id: 'deal_2', lead_id: 'lead_2' }));
+    deals.save(dealState({ deal_id: 'deal_3', lead_id: 'lead_1' }));
+
+    expect(deals.listByLeadId('lead_1').map((deal) => deal.deal_id)).toEqual(['deal_1', 'deal_3']);
+    expect(deals.listByLeadId('lead_missing')).toEqual([]);
+    expect(deals.list()).toHaveLength(3);
+  });
+
+  it('Deal 反查走 idx_entity_state_lead，而不是扫全部 Deal', () => {
+    const sqlite = tempDb();
+    const leads = new SqliteStateStore<LeadState>('lead', (s) => s.lead_id, { sqlite });
+    const deals = new SqliteStateStore<DealState>('deal', (s) => s.deal_id, { sqlite });
+    for (let index = 0; index < 400; index += 1) {
+      leads.save(leadState({ lead_id: `lead_${index}` }));
+      deals.save(dealState({ deal_id: `deal_a_${index}`, lead_id: `lead_${index % 40}` }));
+      deals.save(dealState({ deal_id: `deal_b_${index}`, lead_id: `lead_x_${index % 40}` }));
+    }
+    // 打开连接时表还是空的，统计要在数据落地后才反映索引选择性
+    sqlite.refreshQueryStats();
+
+    const plan = sqlite.db
+      .prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT state FROM entity_states
+         WHERE entity_type = ? AND json_extract(state, '$.lead_id') = ?
+         ORDER BY entity_id`,
+      )
+      .all('deal', 'lead_7') as unknown as Array<{ detail: string }>;
+
+    expect(plan.map((row) => row.detail).join('\n')).toContain('idx_entity_state_lead');
+    expect(plan.map((row) => row.detail).join('\n')).not.toContain('SCAN entity_states');
+  });
+
+  it('事件按 event_id 取回单条，并走 idx_events_event_id', () => {
+    const sqlite = tempDb();
+    const events = new SqliteEventStore({ sqlite });
+    events.append(leadCreatedEvent());
+    events.append(leadCreatedEvent({ event_id: 'evt_0042', idempotency_key: 'lead.created:crm:rec_2002' }));
+
+    expect(events.getByEventId('evt_0042')?.event.event_id).toBe('evt_0042');
+    expect(events.getByEventId('evt_0001')?.event.idempotency_key).toBe('lead.created:crm:rec_1001');
+    expect(events.getByEventId('evt_missing')).toBeUndefined();
+
+    const plan = sqlite.db
+      .prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT sequence, idempotency_key, event, processing_status
+         FROM events WHERE json_extract(event, '$.event_id') = ?
+         ORDER BY sequence LIMIT 1`,
+      )
+      .all('evt_0001') as unknown as Array<{ detail: string }>;
+
+    expect(plan.map((row) => row.detail).join('\n')).toContain('idx_events_event_id');
+    expect(plan.map((row) => row.detail).join('\n')).not.toContain('SCAN events');
+  });
+});
+
+describe('分页与计数下推', () => {
+  it('Workflow 列表按 status/limit/offset 下推，计数走 COUNT 而非全表物化', () => {
+    const sqlite = tempDb();
+    const store = new SqliteWorkflowStateStore({ sqlite });
+    for (let index = 1; index <= 5; index += 1) {
+      store.save(
+        workflowState({
+          workflow_instance_id: `wf_${index}`,
+          subject_id: `lead_${index}`,
+          status: index <= 2 ? 'failed' : 'waiting_result',
+        }),
+      );
+    }
+
+    expect(store.count()).toBe(5);
+    expect(store.count('failed')).toBe(2);
+    expect(store.countByStatus()).toEqual({ failed: 2, waiting_result: 3 });
+
+    // 翻页顺序稳定（workflow_instance_id 升序），多取一条即可判断 has_more
+    expect(store.list({ limit: 2 }).map((w) => w.workflow_instance_id)).toEqual(['wf_1', 'wf_2']);
+    expect(store.list({ limit: 2, offset: 2 }).map((w) => w.workflow_instance_id)).toEqual([
+      'wf_3',
+      'wf_4',
+    ]);
+    expect(store.list({ limit: 2, offset: 4 }).map((w) => w.workflow_instance_id)).toEqual(['wf_5']);
+    expect(store.list()).toHaveLength(5);
+
+    // 状态过滤同样下推，而不是先把 5 条全读出来再在内存里筛
+    expect(store.list({ status: 'failed' }).map((w) => w.workflow_instance_id)).toEqual([
+      'wf_1',
+      'wf_2',
+    ]);
+    expect(
+      store.list({ status: 'failed', limit: 1, offset: 1 }).map((w) => w.workflow_instance_id),
+    ).toEqual(['wf_2']);
+    expect(store.count('missing')).toBe(0);
+    expect(store.countByStatus()['missing']).toBeUndefined();
+  });
+
+  it('异常列表按 status/limit/offset 下推，count 用 COUNT(*)', () => {
+    const sqlite = tempDb();
+    const queue = new SqliteExceptionQueue({ sqlite });
+    queue.enqueue(exceptionInput());
+    queue.enqueue(exceptionInput({ reason: 'idempotency_conflict' }));
+    const third = queue.enqueue(exceptionInput({ reason: 'unmatched_event' }));
+    queue.resolve(third.exception_id, '人工确认后补录');
+
+    expect(queue.count()).toBe(3);
+    expect(queue.count('open')).toBe(2);
+    expect(queue.count('resolved')).toBe(1);
+
+    expect(queue.list({ limit: 2 })).toHaveLength(2);
+    expect(queue.list({ limit: 2, offset: 2 })).toHaveLength(1);
+    expect(queue.list({ status: 'open' })).toHaveLength(2);
+    expect(queue.list({ status: 'resolved' })).toHaveLength(1);
+    expect(queue.listOpen({ limit: 1 })).toHaveLength(1);
+    expect(queue.listOpen()).toHaveLength(2);
+    expect(queue.list()).toHaveLength(3);
   });
 });
 

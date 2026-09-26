@@ -1,12 +1,19 @@
+import type { ActionType } from '../decision/types';
 import type { ParsedEvent } from '../events/dictionary';
+import { BusinessError } from '../errors';
 import type {
+  AuditAction,
   AuditEntry,
+  AuditResult,
   ContactState,
   DealState,
   ExceptionRecord,
   LeadState,
+  MemoryEntry,
   NewAuditEntry,
   NewException,
+  NewMemoryEntry,
+  PendingActionRecord,
   WorkflowInstanceState,
 } from './types';
 
@@ -45,7 +52,23 @@ export interface EventStore {
   /** 标记处理成功，此后同一事件的重复投递返回 duplicate。 */
   markProcessed(idempotencyKey: string): StoredEvent;
   getByIdempotencyKey(idempotencyKey: string): StoredEvent | undefined;
+  /**
+   * 按 `event_id` 精确取回单条事件。
+   *
+   * 重试路径要按 `last_processed_event_id` 找回「最近一次处理的事件」；
+   * 走 `list().find()` 等于每次重试都全表扫一遍事件日志，且历史只增不减。
+   * 持久化实现必须走索引（见 `sqlite-db.ts` 中的表达式索引）。
+   */
+  getByEventId(eventId: string): StoredEvent | undefined;
   list(): readonly StoredEvent[];
+  /**
+   * 按 Lead 查询该主体的事件，**按 sequence 倒序取最近 limit 条**。
+   *
+   * 引擎每处理一个事件都要构造 Decision Context，必须只读取与当前主体相关的事件：
+   * 对整个事件日志做 `list()` 会让处理耗时随事件总量线性增长（实测 20k 事件时单事件 1.4s）。
+   * 持久化实现必须走索引（见 `sqlite-db.ts` 中的表达式索引）。
+   */
+  listByLeadId(leadId: string, limit: number): readonly StoredEvent[];
 }
 
 /**
@@ -75,16 +98,71 @@ export interface AuditLogStore {
   listByEventId(eventId: string): readonly AuditEntry[];
   /** 查询某个 ProposedAction 的审批与执行链路。 */
   listByActionId(actionId: string): readonly AuditEntry[];
+  /**
+   * 按条件查询审计记录，**默认按写入顺序倒序**（最近的在前）。
+   *
+   * 审计日志只增不减，任何「读全表再内存过滤」的调用都会随运行时间线性变慢
+   * （`auto_actions_today` 计数、按实例追溯审批链路、控制面查询都属于此类）。
+   */
+  query(filter: AuditQuery): readonly AuditEntry[];
+  /** 统计符合条件的记录条数；持久化实现应使用 COUNT 而不物化记录本体。 */
+  count(filter: AuditQuery): number;
+}
+
+export interface AuditQuery {
+  readonly workflow_instance_id?: string;
+  readonly event_id?: string;
+  readonly action_id?: string;
+  readonly action?: AuditAction;
+  readonly action_type?: ActionType;
+  readonly result?: AuditResult;
+  /** 只返回 occurred_at >= 该时间的记录（ISO-8601 带时区）。 */
+  readonly occurred_at_from?: string;
+  /** 只返回 occurred_at <= 该时间的记录（ISO-8601 带时区）。 */
+  readonly occurred_at_to?: string;
+  /** 最近 N 条；不传表示不限制。 */
+  readonly limit?: number;
+  /**
+   * 返回顺序。`desc`（默认）按写入顺序倒序，适合「最近发生了什么」的运维查询；
+   * `asc` 按写入顺序正序，适合「一条链路的完整先后」追溯。
+   */
+  readonly order?: 'asc' | 'desc';
 }
 
 /** 异常队列：承载无法安全自动处理的输入，既不丢弃也不覆盖当前事实。 */
+export type ExceptionStatus = ExceptionRecord['status'];
+
+/**
+ * 分页选项：把 limit/offset 下推给存储层。
+ *
+ * 控制面列表接口若先 `list()` 全表再内存截断，每次翻页都要物化全部记录并逐条 JSON.parse；
+ * 记录数随运行时间增长，这会让 `/workflows`、`/exceptions` 越跑越慢。
+ */
+export interface ListOptions {
+  readonly limit?: number;
+  readonly offset?: number;
+}
+
+/** 按状态过滤的列表选项；状态是 exceptions 表的真实列（有索引）。 */
+export interface StatusedListOptions extends ListOptions {
+  readonly status?: ExceptionStatus;
+}
+
 export interface ExceptionQueueStore {
   enqueue(input: NewException): ExceptionRecord;
   get(exceptionId: string): ExceptionRecord | undefined;
-  list(): readonly ExceptionRecord[];
-  listOpen(): readonly ExceptionRecord[];
-  resolve(exceptionId: string, resolution: string): ExceptionRecord;
-  discard(exceptionId: string, resolution: string): ExceptionRecord;
+  list(options?: StatusedListOptions): readonly ExceptionRecord[];
+  listOpen(options?: ListOptions): readonly ExceptionRecord[];
+  /** 记录条数；持久化实现用 COUNT(*)，不物化记录本体。 */
+  count(status?: ExceptionStatus): number;
+  /**
+   * 标记异常已处理（人工给出结论）。
+   * 处理结论必须能回答「谁、何时、为什么」，因此会一并记录 `resolved_by` / `resolved_at`；
+   * 调用方（引擎控制面入口）负责同时追加 Audit Log。
+   */
+  resolve(exceptionId: string, resolution: string, actorId?: string, resolvedAt?: string): ExceptionRecord;
+  /** 标记异常已丢弃：明确判定该输入不应产生任何业务效果。 */
+  discard(exceptionId: string, resolution: string, actorId?: string, resolvedAt?: string): ExceptionRecord;
 }
 
 /** State 只存当前事实。 */
@@ -94,12 +172,49 @@ export interface StateStore<T> {
   list(): readonly T[];
 }
 
+/**
+ * Memory：历史互动、摘要与偏好。只追加、可检索，供 Decision Context 使用。
+ * 它记录的是「发生过什么」，因此不提供修改与删除。
+ */
+export interface MemoryStore {
+  append(entry: NewMemoryEntry): MemoryEntry;
+  /** 某个主体（通常是 Lead）的全部记忆，按写入顺序返回。 */
+  list(subjectId: string): readonly MemoryEntry[];
+  listAll(): readonly MemoryEntry[];
+}
+
+/**
+ * 待审批动作存储：让 Human Review 在进程重启后仍然可审批。
+ * 保存动作快照而非仅保存 action_id，避免重启后依赖内存中的动作表。
+ */
+export interface PendingActionStore {
+  put(record: PendingActionRecord): PendingActionRecord;
+  get(actionId: string): PendingActionRecord | undefined;
+  /** 该 Workflow 当前处于 pending 的动作；没有则返回 undefined。 */
+  getPending(workflowInstanceId: string): PendingActionRecord | undefined;
+  list(): readonly PendingActionRecord[];
+}
+
+/** 按状态分页列 Workflow 实例的查询条件。 */
+export interface WorkflowListOptions extends ListOptions {
+  readonly status?: string;
+}
+
 export interface WorkflowStateStore extends StateStore<WorkflowInstanceState> {
   /** 按业务幂等 key 查找唯一实例，避免同一业务对象产生第二条并行流程。 */
   findByBusinessKey(businessKey: string): WorkflowInstanceState | undefined;
+  /**
+   * 分页列表（默认按 workflow_instance_id 升序，翻页顺序稳定）。
+   * `status` / `limit` / `offset` 下推到存储层，避免「全表物化再内存截断」。
+   */
+  list(query?: WorkflowListOptions): readonly WorkflowInstanceState[];
+  /** 记录条数（可按状态过滤）；持久化实现用 COUNT(*)。 */
+  count(status?: string): number;
+  /** 按状态分组计数，供 `/metrics` 抓取时不再物化每个实例的完整 JSON。 */
+  countByStatus(): Readonly<Record<string, number>>;
 }
 
-export class WorkflowBusinessKeyConflictError extends Error {
+export class WorkflowBusinessKeyConflictError extends BusinessError {
   constructor(
     readonly businessKey: string,
     readonly existingInstanceId: string,
@@ -112,9 +227,9 @@ export class WorkflowBusinessKeyConflictError extends Error {
   }
 }
 
-export class ExceptionNotFoundError extends Error {
+export class ExceptionNotFoundError extends BusinessError {
   constructor(readonly exceptionId: string) {
-    super(`异常记录不存在: ${exceptionId}`);
+    super(`异常记录不存在: ${exceptionId}`, 404);
     this.name = 'ExceptionNotFoundError';
   }
 }
@@ -127,5 +242,16 @@ export class EventNotAppendedError extends Error {
 }
 
 export type LeadStateStore = StateStore<LeadState>;
-export type DealStateStore = StateStore<DealState>;
+
+/**
+ * Deal 必须能按 `lead_id` 反查。
+ *
+ * `#context` 每处理一个事件都要读一次本线索的成交阶段：全表 `list()` 再内存 `find()`
+ * 会让单事件耗时随 Deal 总量线性增长。持久化实现配合
+ * `idx_entity_state_lead` 表达式索引走索引查找。
+ */
+export interface DealStateStore extends StateStore<DealState> {
+  listByLeadId(leadId: string): readonly DealState[];
+}
+
 export type ContactStateStore = StateStore<ContactState>;

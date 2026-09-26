@@ -62,3 +62,20 @@ export function describesSameFact(
     canonicalStringify(left.payload) === canonicalStringify(right.payload)
   );
 }
+
+/**
+ * 同一 Workflow 的当前待审批动作：若存在多条记录，取最后写入的那条。
+ * InMemory 与持久化 PendingActionStore 共用。
+ */
+export function pendingOf<T extends { workflow_instance_id: string; status: string }>(
+  records: readonly T[],
+  workflowInstanceId: string,
+): T | undefined {
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    const record = records[index]!;
+    if (record.workflow_instance_id === workflowInstanceId && record.status === 'pending') {
+      return record;
+    }
+  }
+  return undefined;
+}

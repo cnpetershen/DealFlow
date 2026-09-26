@@ -1,0 +1,101 @@
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'Microsoft YaHei, Segoe UI, sans-serif','fontSize':'14px','lineColor':'#5b6b7c'}}}%%
+flowchart LR
+
+  subgraph SRC["1 · 外部事实来源 —— 事实只能由来源事件声明，引擎不猜测"]
+    direction TB
+    S1["CRM / 表单 / 导入<br/>lead.created · contact.recorded<br/>deal.created"]
+    S2["沟通渠道<br/>email.sent · email.replied<br/>meeting.scheduled · proposal.sent"]
+    S3["任务与阶段系统<br/>task.overdue · deal.stage_changed"]
+  end
+
+  subgraph EDGE["2 · 接入层（node:http，无框架）"]
+    direction TB
+    W["Webhook 入口<br/>限流 → Bearer → HMAC<br/>重放保护"]
+    CP["控制面 API<br/>审批 · 取消 · 重试<br/>对账 · 异常处理"]
+    HUM["人工在环<br/>销售 · 授权审批人 · 运维"]
+  end
+
+  subgraph ENG["3 · WorkflowEngine —— 事件驱动的人机协同编排核心"]
+    direction TB
+    E1["事件登记<br/>信封校验<br/>idempotency_key 去重"]
+    E2["Resume<br/>匹配等待条件<br/>恢复实例 · Replan"]
+    E3["状态机迁移<br/>Lead · Deal<br/>WorkflowInstance"]
+    E4["Decision<br/>只输出 ProposedAction<br/>不执行"]
+    E5{"Policy<br/>Reject → Human Review → Auto<br/>Reject 不执行，只追加审计"}
+    E6["Executor 端口<br/>执行幂等 key"]
+    E7["待审批动作快照<br/>重启后仍可审批"]
+    E9["Provider 对账 reconcile<br/>已提交 / 未提交 / 无法判定"]
+    ER["失败分类<br/>transient · permanent · unknown"]
+  end
+
+  subgraph OUT["4 · 外部副作用出口"]
+    direction TB
+    O1["ProviderAdapter<br/>submit + reconcile<br/>回执原样透传"]
+    O2["真实动作<br/>发邮件 · 建会议<br/>发方案 · 建任务"]
+  end
+
+  subgraph PRT["5 · 接口化端口 —— Store / Executor 全部接口化，InMemory 与 Sqlite 双实现"]
+    direction TB
+    P1["EventStore<br/>只追加 · 不可变"]
+    P2["StateStore<br/>只存当前事实"]
+    P3["MemoryStore<br/>互动 · 摘要 · 偏好"]
+    P4["AuditLog<br/>只追加 · 不可改"]
+    P5["ExceptionQueue<br/>冲突 · 未匹配 · 迟到"]
+    P6["PendingActionStore<br/>审批完整快照"]
+    R1[("SQLite 单库<br/>表达式索引 · 查询不读全表<br/>UnitOfWork 单写事务")]
+  end
+
+  subgraph RUN["6 · 跨切面 · 运行时底座"]
+    direction TB
+    R4["启动恢复 recoverFromEventLog<br/>重放 pending 事件重建 State<br/>不重放外部副作用"]
+    R3["观测<br/>RuntimeMetrics · JsonLogger<br/>/healthz · /metrics"]
+    R5["运维<br/>优雅关闭 grace_ms<br/>SQLite 备份与恢复"]
+  end
+
+  subgraph CAP["7 · 交付的产品能力"]
+    direction TB
+    C1["最小销售闭环自动化<br/>Lead → 分配 → 互动 → Deal 成交 / 丢单"]
+    C2["人机协同<br/>Auto / Human Review / Reject"]
+    C3["全程可审计<br/>谁 · 何时 · 基于什么事实做了什么决定"]
+    C4["可靠恢复<br/>幂等 + 对账 + 异常兜底 + 重启重建"]
+  end
+
+  SRC ==>|"事实事件投递"| W
+  W ==> E1
+  E1 --> E2 --> E3 --> E4 --> E5
+  E5 -->|"Auto"| E6
+  E5 -->|"Human Review"| E7
+  E6 -.->|"submitted = unknown"| E9
+  E9 -.-> E2
+  E6 -.->|"失败"| ER
+  ER -.->|"transient 重试，复用同一幂等 key"| E6
+  HUM -->|"人工判断与结论"| CP
+  CP -->|"replan：不复用旧计划，重新过 Policy"| E2
+  E7 -->|"待审批动作"| CP
+  E6 ==>|"派发（已获 Auto 或 Approved）"| O1
+  O1 ==> O2
+  O2 -.->|"结果事件回执：确认动作已发生<br/>email.sent · meeting.scheduled · proposal.sent"| W
+  P1 & P2 & P3 & P4 & P5 & P6 --> R1
+  ENG -.->|"全部读写经接口化端口"| PRT
+  PRT ~~~ RUN
+  RUN ~~~ CAP
+
+  classDef src fill:#E8F0FE,stroke:#4A6FA5,stroke-width:1px,color:#12294a
+  classDef ing fill:#FFF4E5,stroke:#C88A2E,stroke-width:1px,color:#4a3000
+  classDef eng fill:#E7F6EC,stroke:#2E8B57,stroke-width:1px,color:#10331e
+  classDef pol fill:#FFE9D6,stroke:#D2691E,stroke-width:2px,color:#4a2200
+  classDef hum fill:#FDE8EC,stroke:#C2185B,stroke-width:1px,color:#4a0d1e
+  classDef prt fill:#F3E8FD,stroke:#7A4BBD,stroke-width:1px,color:#2c1145
+  classDef run fill:#ECEFF1,stroke:#607D8B,stroke-width:1px,color:#1d2629
+  classDef out fill:#E0F7FA,stroke:#00838F,stroke-width:1px,color:#00363a
+  classDef cap fill:#FFFDE7,stroke:#C0A000,stroke-width:1px,color:#463c00
+
+  class S1,S2,S3 src
+  class W,CP ing
+  class HUM hum
+  class E1,E2,E3,E4,E6,E7,E9,ER eng
+  class E5 pol
+  class O1,O2 out
+  class P1,P2,P3,P4,P5,P6 prt
+  class R1,R3,R4,R5 run
+  class C1,C2,C3,C4 cap

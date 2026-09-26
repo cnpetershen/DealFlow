@@ -20,6 +20,7 @@ type Equals<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B 
 const EVENT_TYPES = [
   'lead.created',
   'lead.assigned',
+  'contact.recorded',
   'deal.created',
   'email.sent',
   'email.replied',
@@ -44,6 +45,16 @@ const fixtures: Record<EventType, Record<string, unknown>> = {
     previous_owner_id: null,
     assignment_reason: 'rule:territory',
   },
+  'contact.recorded': {
+    contact_id: 'contact_1',
+    lead_id: 'lead_1',
+    full_name: 'Zhang San',
+    email: 'buyer@acme.example',
+    organization_id: 'org_acme',
+    contact_preference: 'auto_allowed',
+    contactability: 'reachable',
+    is_new_contact: false,
+  },
   'deal.created': {
     deal_id: 'deal_1',
     lead_id: 'lead_1',
@@ -64,6 +75,9 @@ const fixtures: Record<EventType, Record<string, unknown>> = {
     template_id: 'tpl_intro',
     workflow_instance_id: 'wf_1',
     sent_at: '2026-09-24T10:00:00+08:00',
+    provider_reference: 'sendgrid:message-123',
+    provider: 'sendgrid',
+    correlation_id: 'corr_1',
   },
   'email.replied': {
     message_id: 'msg_1',
@@ -74,6 +88,9 @@ const fixtures: Record<EventType, Record<string, unknown>> = {
     sentiment: 'positive',
     intent: 'request_pricing',
     body_reference: 's3://mail/msg_2',
+    provider_reference: 'sendgrid:event-789',
+    provider: 'sendgrid',
+    correlation_id: 'corr_1',
   },
   'meeting.scheduled': {
     meeting_id: 'mtg_1',
@@ -84,6 +101,9 @@ const fixtures: Record<EventType, Record<string, unknown>> = {
     scheduled_end_at: '2026-09-25T14:30:00+08:00',
     calendar_provider: 'google',
     status: 'scheduled',
+    provider_reference: 'google:event-1',
+    provider: 'google',
+    correlation_id: 'corr_1',
   },
   'proposal.sent': {
     proposal_id: 'prop_1',
@@ -95,6 +115,9 @@ const fixtures: Record<EventType, Record<string, unknown>> = {
     currency: 'CNY',
     document_reference: 's3://docs/prop_1.pdf',
     sent_at: '2026-09-26T10:00:00+08:00',
+    provider_reference: 'docsend:prop-1',
+    provider: 'docsend',
+    correlation_id: 'corr_1',
   },
   'deal.stage_changed': {
     deal_id: 'deal_1',

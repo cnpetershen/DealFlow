@@ -1,8 +1,30 @@
 import type { ProposedAction } from '../decision/types';
 
+/**
+ * 执行回执：一次成功派发从外部提供商拿到的对账标识。
+ *
+ * 只有回执能让「本地 action」与「提供商侧副作用」对上账，因此它必须一路保留到审计：
+ * `ProviderAdapter.submit` → `ProviderAdapterExecutor` → `ExecutionResult` → `action_dispatched` AuditEntry。
+ * 对应 docs/domain.md「Executor Error Contract」与 docs/events.md「Result Event 契约」。
+ */
+export interface ExecutionReceipt {
+  readonly provider: string | null;
+  /** 提供商侧唯一回执标识（如邮件 message-id）。 */
+  readonly provider_reference: string | null;
+  /** 提供商关联 id，可与本地 action_id / execution_idempotency_key 对账。 */
+  readonly correlation_id: string | null;
+}
+
+/** 未产生外部回执时的空回执（例如进程内 Executor）。 */
+export const NO_RECEIPT: ExecutionReceipt = {
+  provider: null,
+  provider_reference: null,
+  correlation_id: null,
+};
+
 export type ExecutionResult =
-  | { readonly status: 'accepted'; readonly action_id: string; readonly execution_idempotency_key: string }
-  | { readonly status: 'duplicate'; readonly action_id: string; readonly execution_idempotency_key: string };
+  | ({ readonly status: 'accepted'; readonly action_id: string; readonly execution_idempotency_key: string } & ExecutionReceipt)
+  | ({ readonly status: 'duplicate'; readonly action_id: string; readonly execution_idempotency_key: string } & ExecutionReceipt);
 
 /** 执行失败分类：transient 可重试，permanent 需人工介入。 */
 export type ErrorClassification = 'transient' | 'permanent';
@@ -34,6 +56,30 @@ export interface ClassifiedExecutionError extends Error {
 
 export interface Executor {
   execute(action: ProposedAction): Promise<ExecutionResult>;
+}
+
+/** 一次对账的结论。`submitted` 为 `'unknown'` 表示提供商侧也无法判定。 */
+export interface ReconciledSubmission {
+  readonly submitted: boolean | 'unknown';
+  /** 作出结论的提供商标识，便于把对账结果写进审计回执。 */
+  readonly provider: string | null;
+  readonly provider_reference: string | null;
+}
+
+/**
+ * 支持对账的执行器（可选能力）。
+ *
+ * `failure_submitted === 'unknown'`（超时/网络中断）时禁止简单 retry，必须先问提供商
+ * 「这次提交到底有没有落到你那边」。真实提供商适配器应实现该能力；
+ * 进程内 Executor 可以不实现，引擎会在对账请求上明确报错而不是猜一个结论。
+ * 与 `EventStore` / `ClaimableEventStore` 同一模式：基础端口保持最小，能力按需探测。
+ */
+export interface ReconcilableExecutor extends Executor {
+  reconcile(action: ProposedAction): Promise<ReconciledSubmission>;
+}
+
+export function isReconcilableExecutor(executor: Executor): executor is ReconcilableExecutor {
+  return typeof (executor as Partial<ReconcilableExecutor>).reconcile === 'function';
 }
 
 /** 规范化后的执行错误字段；调用方可安全读取 classification / submitted 等。 */

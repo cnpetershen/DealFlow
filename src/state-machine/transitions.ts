@@ -195,6 +195,7 @@ export const DEAL_TRANSITIONS: readonly TransitionRow<DealStage, EventType>[] = 
 export const WORKFLOW_TRIGGERS = [
   'started',
   'action_dispatched',
+  'awaiting_events',
   'approval_required',
   'result_event_matched',
   'approval_granted',
@@ -223,6 +224,13 @@ export const WORKFLOW_TRANSITIONS: readonly TransitionRow<WorkflowStatus, Workfl
     to: ['waiting_result'],
     condition: '动作已交给 Executor 且需等待外部结果',
     workflow_action: '记录等待条件与执行幂等 key',
+  },
+  {
+    from: 'running',
+    trigger: 'awaiting_events',
+    to: ['waiting_result'],
+    condition: '当前无可执行动作，但主体仍可被后续事件推进',
+    workflow_action: '按当前 State 推导等待事件集合并休眠，而不是结束流程',
   },
   {
     from: 'running',
