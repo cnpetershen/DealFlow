@@ -21,9 +21,11 @@ DealFlow 把「一条线索从进线到成交/丢单」的跟进闭环，做成�
 
 它不替你发邮件、建会议——它只建议这些动作，经 Policy 判定、必要时经人工审批后，才通过接口化的 Executor 派发，并用「结果事件回执」确认动作真的发生了。
 
-![DealFlow 架构](docs/diagrams/dealflow-product-architecture.png)
+![DealFlow 架构](docs/mermaid-sales.png)
 
 图：从左到右是「外部事实来源 → 接入层（Webhook + 控制面）→ WorkflowEngine 闭环（登记 → 恢复 → 状态机 → Decision → Policy → Executor）→ 外部副作用出口」，底部是接口化端口与运行时底座，右侧是交付的产品能力。矢量版见 docs/diagrams/dealflow-product-architecture.svg。
+
+![DealFlow 销售者架构](docs/mermaid-sales-workitem.png)
 
 核心设计原则
 
