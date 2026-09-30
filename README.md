@@ -96,9 +96,9 @@ npm start / npm run dev / npm run backup 会自动加载仓库根目录的 .env�
 
 5. 验证它真的跑起来了
 
-    # 1) 存活探针（无鉴权）
+    ## 1) 存活探针（无鉴权）
     curl -s http://127.0.0.1:3000/healthz
-    # → {"status":"ok"}
+     → {"status":"ok"}
     
     # 2) 投一个「新线索」事件
     curl -s -X POST http://127.0.0.1:3000/webhooks/dealflow \
