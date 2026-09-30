@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { DecisionContext } from '../decision/context';
 import type { Decider } from '../decision/interfaces';
 import { InMemoryExecutor } from '../executor/in-memory';
-import { leadAssignedEvent, leadCreatedEvent, emailSentEvent, emailRepliedEvent, dealCreatedEvent, dealStageChangedEvent, dealState, contactState, contactRecordedEvent, proposedAction, taskOverdueEvent, meetingScheduledEvent } from '../testing/fixtures';
+import { leadAssignedEvent, leadCreatedEvent, emailSentEvent, emailRepliedEvent, dealCreatedEvent, dealStageChangedEvent, dealState, contactState, contactRecordedEvent, proposedAction, taskOverdueEvent, meetingScheduledEvent, fixedNow } from '../testing/fixtures';
 import { InMemoryAuditLog, InMemoryEventStore, InMemoryExceptionQueue, InMemoryPendingActionStore, InMemoryStateStore, InMemoryWorkflowStateStore } from '../stores/in-memory';
 import type { ContactState, DealState, LeadState } from '../stores/types';
 import { RuleBasedDecider } from '../decision/rule-based-decider';
@@ -34,6 +34,8 @@ function createEngine(makeDecider?: () => Decider, overrides: Partial<WorkflowEn
       decider,
       policy: new RuleBasedPolicyEvaluator(),
       contact_defaults: () => contactState(),
+      // 控制面操作（approve/reject）的判定时刻固定，避免测试随真实运行时间漂移
+      now: fixedNow,
       ...overrides,
     });
   const engine = newEngine(
@@ -377,6 +379,51 @@ describe('WorkflowEngine', () => {
     expect(workflow).toMatchObject({ status: 'waiting_result', awaiting_event_types: ['meeting.scheduled'] });
     expect(executor.attempts()).toHaveLength(2);
     expect(audit.list().some((entry) => entry.action === 'action_approved')).toBe(true);
+  });
+
+  it('事件时间很旧时，建议在提出后 TTL 内仍可批准执行（不会出生即过期）', async () => {
+    // fixtures 的事件时间是 2026-09-24，而引擎做出建议的时刻是 2026-09-30：
+    // 动作有效期必须从提出时刻起算，否则批准会被 action_expired 吞掉。
+    let now = '2026-09-30T10:00:00+08:00';
+    const { engine, workflows, executor, audit } = createEngine(undefined, { now: () => now });
+    await engine.handleEvent(leadCreatedEvent({ payload: { ...leadCreatedEvent().payload, contact_id: 'contact_1' } }));
+    await engine.handleEvent(leadAssignedEvent());
+    await engine.handleEvent(emailSentEvent());
+    await engine.handleEvent(emailRepliedEvent());
+
+    const proposed = audit.list().filter((entry) => entry.action === 'decision_proposed');
+    const actionId = proposed[proposed.length - 1]?.action_id ?? '';
+
+    now = '2026-09-30T11:00:00+08:00';
+    const outcome = await engine.approve('wf_lead_follow_up_lead_1', actionId, 'user_7');
+
+    expect(outcome.stale_action_replanned).toBe(false);
+    expect(workflows.get('wf_lead_follow_up_lead_1')).toMatchObject({
+      status: 'waiting_result',
+      awaiting_event_types: ['meeting.scheduled'],
+    });
+    expect(executor.attempts()).toHaveLength(2);
+  });
+
+  it('建议超过 TTL 仍未处理时，批准被判过期并重新规划', async () => {
+    let now = '2026-09-30T10:00:00+08:00';
+    const { engine, workflows, executor, audit } = createEngine(undefined, { now: () => now });
+    await engine.handleEvent(leadCreatedEvent({ payload: { ...leadCreatedEvent().payload, contact_id: 'contact_1' } }));
+    await engine.handleEvent(leadAssignedEvent());
+    await engine.handleEvent(emailSentEvent());
+    await engine.handleEvent(emailRepliedEvent());
+
+    const proposed = audit.list().filter((entry) => entry.action === 'decision_proposed');
+    const actionId = proposed[proposed.length - 1]?.action_id ?? '';
+
+    // schedule_meeting 的 TTL 是 72h，超过后批准必须重新规划而不是执行
+    now = '2026-10-05T10:00:00+08:00';
+    const outcome = await engine.approve('wf_lead_follow_up_lead_1', actionId, 'user_7');
+
+    expect(outcome.stale_action_replanned).toBe(true);
+    expect(workflows.get('wf_lead_follow_up_lead_1')?.status).toBe('needs_review');
+    expect(executor.attempts()).toHaveLength(1);
+    expect(audit.list().some((entry) => entry.action === 'action_stale')).toBe(true);
   });
 
   it('reject 将被拒动作类型登记为约束，重新规划后不再提出同一动作', async () => {

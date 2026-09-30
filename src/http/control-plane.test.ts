@@ -22,6 +22,7 @@ import {
   dealStageChangedEvent,
   emailRepliedEvent,
   emailSentEvent,
+  fixedNow,
   leadAssignedEvent,
   leadCreatedEvent,
 } from '../testing/fixtures';
@@ -65,6 +66,8 @@ function buildStack(executorOverride?: WorkflowEngineOptions['executor']) {
     decider: new RuleBasedDecider({ createActionId: (() => { let n = 0; return () => `action_${++n}`; })() }),
     policy: new RuleBasedPolicyEvaluator(),
     contact_defaults: () => contactState(),
+    // 控制面操作的判定时刻固定，避免测试随真实运行时间漂移
+    now: fixedNow,
   });
   return { engine, workflows, audit, exceptions, pendingActions, leads, contacts, deals };
 }
@@ -213,6 +216,27 @@ describe('控制面 HTTP 入口', () => {
     const policyRejected = pendingActions.list().filter((record) => record.decision === 'policy_rejected');
     expect(policyRejected).toHaveLength(1);
     expect(policyRejected[0]).toMatchObject({ status: 'decided', decided_by: 'policy' });
+  });
+
+  it('待审动作对外报告 requires_approval=true：取 Policy 结论，而不是 Decider 的草案标记', async () => {
+    const { engine, baseUrl } = await startServer({ token: 'secret' });
+    await engine.handleEvent(
+      leadCreatedEvent({ payload: { ...leadCreatedEvent().payload, contact_id: 'contact_1' } }),
+    );
+    // 新联系人的外发必须人工审核，而 Decider 对 send_email 的草案标记是 false
+    await engine.handleEvent(
+      contactRecordedEvent({ payload: { ...contactRecordedEvent().payload, is_new_contact: true } }),
+    );
+    await engine.handleEvent(leadAssignedEvent());
+
+    const listed = await (await call(baseUrl, '/workflows?status=needs_review', { token: 'secret' })).json() as {
+      items: Array<{ status: string; pending_action: { action_type: string; requires_approval: boolean } | null }>;
+    };
+    expect(listed.items).toHaveLength(1);
+    expect(listed.items[0]).toMatchObject({
+      status: 'needs_review',
+      pending_action: { action_type: 'send_email', requires_approval: true },
+    });
   });
 
   it('POST approve 让 Human Review 分支真正执行动作', async () => {

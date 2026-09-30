@@ -1544,6 +1544,11 @@ export class WorkflowEngine {
    * 判定时刻 `evaluated_at` 来自触发事件的事实时间 `occurred_at`，而不是服务器本地时钟：
    * 事件驱动路径必须可复现，同一事件在任何时刻处理都得到同一结论。
    * 只有控制面操作（approve/reject/cancel 等没有事件的操作）才回退到注入时钟。
+   *
+   * `proposed_at` 是本次建议的提出时刻（引擎时钟），与 `evaluated_at` 分工不同：
+   * 动作有效期、任务到期时间、会议最早可开始时间都从两者中**较晚者**起算，避免 CRM 回填或
+   * 迟到的事件让建议「出生即过期」，也避免事实时间在未来时新建议被判过期
+   * （见 `decision/context.ts` 的 DecisionContext.proposed_at）。
    */
   #context(w: WorkflowInstanceState, evaluatedAt: string, current: ParsedEvent | null = null): DecisionContext {
     const lead = this.#o.lead_store.get(w.subject_id) ?? null;
@@ -1573,6 +1578,7 @@ export class WorkflowEngine {
     } satisfies PolicyContext);
 
     return {
+      proposed_at: this.#now(),
       workflow_instance: w,
       lead_state: lead,
       contact_state: lead?.contact_id ? this.#o.contact_store.get(lead.contact_id) ?? null : null,

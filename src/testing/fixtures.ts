@@ -11,6 +11,21 @@ import type {
 } from '../stores/types';
 
 /**
+ * 测试专用固定时钟，与 fixtures 的事件时间（2026-09-24）同一天。
+ *
+ * 为什么必须注入：控制面操作（approve / reject / replan / retry / cancel）没有触发事件，
+ * 引擎回退到注入时钟取判定时刻 `evaluated_at`（`src/workflow/engine.ts` 的 `#now`，缺省是真实时钟）。
+ * 而 ProposedAction 的 `expires_at` 由「触发事件 occurred_at + 动作 TTL」推导
+ * （`send_email` 48h / `schedule_meeting` 72h / `advance_deal_stage` 168h）。
+ * 不注入时钟时，测试只在 fixtures 日期之后的 TTL 窗口内是绿的，之后审批会被判
+ * `action_expired` 并转入 stale 重规划，断言集体变红。`src/app/bootstrap.test.ts` 已按此约定注入。
+ */
+export const FIXED_NOW_ISO = '2026-09-24T10:00:00+08:00';
+
+/** 注入给 `WorkflowEngineOptions.now` 的固定时钟。 */
+export const fixedNow = (): string => FIXED_NOW_ISO;
+
+/**
  * payload 允许传入任意形状，便于构造非法或冲突的 payload 场景；
  * 覆盖后的对象不再保证是合法事件，因此各构造函数末尾集中断言一次。
  */
@@ -395,6 +410,7 @@ export function policyContext(overrides: Partial<PolicyContext> = {}): PolicyCon
  */
 export function decisionContext(overrides: Partial<DecisionContext> = {}): DecisionContext {
   return {
+    proposed_at: '2026-09-24T10:05:00+08:00',
     workflow_instance: workflowState({ status: 'running', current_step: 'first_follow_up' }),
     lead_state: leadState({ status: 'assigned', owner_id: 'user_7', contact_id: 'contact_1' }),
     contact_state: contactState(),

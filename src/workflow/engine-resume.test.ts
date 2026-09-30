@@ -21,6 +21,7 @@ import {
   dealState,
   emailRepliedEvent,
   emailSentEvent,
+  fixedNow,
   leadAssignedEvent,
   leadCreatedEvent,
   meetingScheduledEvent,
@@ -55,6 +56,8 @@ function buildStack(options: { contactEmail?: string | null } = {}) {
     executor,
     decider: new RuleBasedDecider({ createActionId: (() => { let n = 0; return () => `action_${++n}`; })() }),
     policy: new RuleBasedPolicyEvaluator(),
+    // 控制面操作的判定时刻固定，避免测试随真实运行时间漂移
+    now: fixedNow,
     // 与 bootstrap 一致：未知联系人默认「新联系人 + 无邮箱 + 仅人工联系」
     contact_defaults: (contactId) =>
       options.contactEmail === undefined
@@ -341,6 +344,7 @@ describe('重启后 Human Review 仍可审批', () => {
       executor: stack.executor,
       decider: new RuleBasedDecider({ createActionId: (() => { let n = 100; return () => `action_${++n}`; })() }),
       policy: new RuleBasedPolicyEvaluator(),
+      now: fixedNow,
     });
 
     const { workflow } = await rebooted.approve(WORKFLOW_ID, actionId, 'user_7');

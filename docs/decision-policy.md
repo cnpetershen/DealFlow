@@ -37,6 +37,18 @@ Context 是 Decision 的输入快照。它不是新的事实来源；当前事�
 - `requires_approval`
 - `expires_at`
 
+**时间字段的锚点**（见 `src/decision/context.ts` 的 `DecisionContext.proposed_at`）：`expires_at` 从
+**「建议提出时刻」与「事实判定时刻」中较晚者**起算 `ACTION_METADATA[action_type].default_ttl_hours`；
+`create_task` 的 `due_at`（起算点后 24h）与 `schedule_meeting` 的 `earliest_start_at` 用同一个起算点。
+这三者都是「建议发出后多久失效 / 最早何时可以执行」的墙上时钟属性，不是事实属性。
+
+- 事实较早（正常情况、CRM 回填、导入、webhook 迟到）→ 用提出时刻，建议不会**出生即过期**；
+  否则人工批准会被 `action_expired` 静默吞掉并转入 stale 重规划。
+- 事实较晚（客户端时钟偏差、预置的未来时间）→ 用事实时刻，保证刚提出的建议满足
+  `expires_at > evaluated_at`，不会在出生那一刻就被 Policy 判过期并静默丢弃。
+
+窗口与事实类判定仍用 `evaluated_at`（= 触发事件 `occurred_at`），保持「同一事件在任何时刻处理得到同一结论」。
+
 ProposedAction 不代表动作已经发生。只有执行器在取得有效的 Auto 结论或人工 Approved 后，才可以尝试执行。真实执行结果必须由外部结果事件确认，例如 `email.sent`、`meeting.scheduled` 或 `proposal.sent`。
 
 ## Policy：Auto 还是 Human Review

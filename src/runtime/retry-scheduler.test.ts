@@ -1,4 +1,4 @@
-﻿import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
 import { RuleBasedDecider } from '../decision/rule-based-decider';
 import { InMemoryExecutor } from '../executor/in-memory';
@@ -13,7 +13,7 @@ import {
   InMemoryWorkflowStateStore,
 } from '../stores/in-memory';
 import type { ContactState, DealState, LeadState } from '../stores/types';
-import { contactState, emailRepliedEvent, emailSentEvent, leadAssignedEvent, leadCreatedEvent } from '../testing/fixtures';
+import { contactState, emailRepliedEvent, emailSentEvent, fixedNow, leadAssignedEvent, leadCreatedEvent } from '../testing/fixtures';
 import { WorkflowEngine } from '../workflow/engine';
 import { RetryScheduler } from './retry-scheduler';
 
@@ -42,6 +42,8 @@ function buildStack() {
     decider: new RuleBasedDecider({ createActionId: (() => { let n = 0; return () => `action_${++n}`; })() }),
     policy: new RuleBasedPolicyEvaluator(),
     contact_defaults: () => contactState(),
+    // 控制面操作的判定时刻固定，避免测试随真实运行时间漂移
+    now: fixedNow,
   });
   return { engine, executor, workflows };
 }

@@ -13,3 +13,6 @@ data/
 *.db
 *.db-wal
 *.db-shm
+# 验收运行产物（由 npm run accept 生成；可运行脚本都在 scripts/）
+acceptance/*
+!acceptance/README.md

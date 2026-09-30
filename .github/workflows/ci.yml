@@ -1,0 +1,61 @@
+# DealFlow CI：跑一键验收 npm run accept
+#
+#   typecheck → 全量单测（642 用例）→ 自起干净实例 → 21 事件走查 → 19 项 MVP 断言
+#
+# 两个系统都跑是有意的：Windows 与 POSIX 在子进程启动方式上不同
+# （例如 Windows 不能用 spawn 直接启动 npm.cmd），只在 Linux 上跑会漏掉这类问题。
+# 想只留 Linux：把 matrix.os 改成 [ubuntu-latest] 即可。
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支的新提交取消仍在跑的旧任务
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  accept:
+    name: 验收（${{ matrix.os }}）
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node（版本取自 .nvmrc）
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: 环境信息
+        run: |
+          node --version
+          npm --version
+
+      - name: 安装依赖（按 lockfile）
+        run: npm ci
+
+      - name: 一键验收
+        run: npm run accept
+
+      - name: 上传验收报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-report-${{ matrix.os }}
+          path: acceptance/report-*.json
+          if-no-files-found: ignore
+          retention-days: 14

@@ -103,6 +103,22 @@ export interface IdempotencyContext {
 }
 
 export interface DecisionContext {
+  /**
+   * 本次建议的提出时刻（引擎时钟）。
+   *
+   * 与 `policy_context.evaluated_at` 分工不同，两者必须分开：
+   * - `evaluated_at` 是**事实判定时刻**：事件驱动路径取触发事件的 `occurred_at`，
+   *   用于发送窗口、事实一致性等必须可复现的判定（同一事件在任何时刻处理得到同一结论）；
+   * - `proposed_at` 是**建议自身的诞生时刻**：动作有效期 `expires_at`、补救任务 `due_at`、
+   *   会议 `earliest_start_at` 都从它与 `evaluated_at` 中**较晚者**起算——这些是「建议发出后多久失效 /
+   *   最早何时可以执行」，属于建议的墙上时钟属性，不是事实属性。
+   *
+   * 为什么不能锚在事件时间上：CRM 回填、导入或 webhook 迟到时，事件时间可能早于动作 TTL，
+   * 建议会「出生即过期」，人工批准被 `action_expired` 静默吞掉并转入 stale 重规划。
+   * 为什么还要取较晚者：事件时间落在未来（客户端时钟偏差、预置数据）时，只按 `proposed_at`
+   * 起算会让 `expires_at` 早于 `evaluated_at`，新建议在出生那一刻就被 Policy 判过期并静默丢弃。
+   */
+  proposed_at: string;
   workflow_instance: WorkflowInstanceState;
   lead_state: LeadState | null;
   contact_state: ContactState | null;

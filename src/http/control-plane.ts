@@ -227,7 +227,16 @@ function summarize(
     failure_submitted: workflow.failure_submitted,
     failure_retry_after: workflow.failure_retry_after,
     updated_at: workflow.updated_at,
-    pending_action: pending === undefined ? null : pending.action,
+    // 对外语义是「这条建议现在是否需要人工批准」，取 Policy 的有效结论：
+    // 实例停在 needs_review 就说明 Policy 判了 Human Review；Decider 的草案标记只在
+    // 「被人工拒绝后重新提出」时为 true，不能回答这个问题（见 docs/operations.md 第 4 节）。
+    pending_action:
+      pending === undefined
+        ? null
+        : {
+            ...pending.action,
+            requires_approval: pending.action.requires_approval || workflow.status === 'needs_review',
+          },
   };
 }
 

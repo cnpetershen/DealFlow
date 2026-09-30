@@ -15,6 +15,7 @@ import {
   contactState,
   emailRepliedEvent,
   emailSentEvent,
+  fixedNow,
   leadAssignedEvent,
   leadCreatedEvent,
 } from '../testing/fixtures';
@@ -43,6 +44,8 @@ function createEngine() {
     decider: new RuleBasedDecider({ createActionId: (() => { let n = 0; return () => `action_${++n}`; })() }),
     policy: new RuleBasedPolicyEvaluator(),
     contact_defaults: () => contactState(),
+    // 控制面操作的判定时刻固定，避免测试随真实运行时间漂移
+    now: fixedNow,
   });
   return { engine, workflows, audit, executor };
 }

@@ -154,7 +154,7 @@ function actionBase(context: DecisionContext, actionType: ActionType) {
     risk_level: metadata.risk_level,
     policy_version: policy.policy_version,
     plan_version: workflow.plan_version,
-    expires_at: addHours(policy.evaluated_at, metadata.default_ttl_hours),
+    expires_at: addHours(proposalAnchor(context), metadata.default_ttl_hours),
   };
 }
 
@@ -173,7 +173,7 @@ function overdueRemedyRule(context: DecisionContext): readonly ProposedActionDra
       parameters: {
         task_type: 'overdue_remedy',
         assigned_to: overdueTask.assigned_to,
-        due_at: addHours(context.policy_context.evaluated_at, 24),
+        due_at: addHours(proposalAnchor(context), 24),
         note: `任务 ${overdueTask.task_id} 已逾期，请确认是否仍需要跟进`,
       },
       reason: `任务 ${overdueTask.task_id}（类型 ${overdueTask.task_type}）已于 ${overdueTask.due_at} 逾期，仍属于当前 Workflow`,
@@ -235,7 +235,7 @@ function meetingAfterReplyRule(context: DecisionContext): readonly ProposedActio
       parameters: {
         agenda: `与 ${contact.full_name ?? '客户'} 确认需求范围与时间安排`,
         duration_minutes: context.verified_config.default_meeting_duration_minutes,
-        earliest_start_at: context.policy_context.evaluated_at,
+        earliest_start_at: proposalAnchor(context),
       },
       reason: `Lead ${lead.lead_id} 已收到客户回复，下一步建议安排会议`,
       expected_outcome: '与客户确认会议时间，获得更明确的资格判断',
@@ -307,6 +307,21 @@ function qualificationAdvanceRule(context: DecisionContext): readonly ProposedAc
 
 function addHours(isoTimestamp: string, hours: number): string {
   return new Date(Date.parse(isoTimestamp) + hours * 3_600_000).toISOString();
+}
+
+/**
+ * 建议的有效期 / 任务到期时间 / 会议最早可开始时间的起点。
+ *
+ * 取「建议提出时刻」与「事实判定时刻」中较晚的一个：
+ * - 事实较早（正常情况、CRM 回填、webhook 迟到）→ 用提出时刻，建议不会「出生即过期」；
+ * - 事实较晚（客户端时钟偏差、预置的未来时间）→ 用事实时刻，保证 `expires_at > evaluated_at`
+ *   这个 Policy 判定所依赖的不变量成立，**刚提出的建议永远不会立刻被判 action_expired**。
+ */
+function proposalAnchor(context: DecisionContext): string {
+  const proposed = Date.parse(context.proposed_at);
+  const evaluated = Date.parse(context.policy_context.evaluated_at);
+
+  return proposed >= evaluated ? context.proposed_at : context.policy_context.evaluated_at;
 }
 
 /**

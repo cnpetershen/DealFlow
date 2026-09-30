@@ -10,7 +10,8 @@
     "backup": "node --disable-warning=ExperimentalWarning --env-file-if-exists=.env --experimental-transform-types --import ./scripts/register.mjs src/tools/backup.ts",
     "test": "vitest",
     "test:run": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "accept": "node scripts/acceptance-suite.mjs"
   },
   "engines": {
     "node": ">=22.22.0"

@@ -107,8 +107,34 @@ describe('RuleBasedDecider 首次跟进', () => {
     expect(action.expected_outcome.length).toBeGreaterThan(0);
   });
 
-  it('有效期按动作元数据的 TTL 从判定时刻推算', () => {
+  it('有效期按动作元数据的 TTL 从建议提出时刻推算', () => {
     expect(only(decisionContext()).expires_at).toBe('2026-09-26T02:05:00.000Z');
+  });
+
+  it('事实很旧时建议不会出生即过期：有效期锚定提出时刻而不是事件时间', () => {
+    // 事件发生在 09-24，建议直到 09-30 才提出（CRM 回填 / webhook 迟到）
+    const action = only(
+      decisionContext({
+        proposed_at: '2026-09-30T10:05:00+08:00',
+        policy_context: policyContext({ evaluated_at: '2026-09-24T10:05:00+08:00' }),
+      }),
+    );
+
+    expect(action.expires_at).toBe('2026-10-02T02:05:00.000Z');
+    expect(Date.parse(action.expires_at)).toBeGreaterThan(Date.parse('2026-09-30T10:05:00+08:00'));
+  });
+
+  it('事实时间晚于提出时刻（客户端时钟偏差 / 预置未来时间）时，建议同样不会出生即过期', () => {
+    const evaluatedAt = '2026-09-30T10:05:00+08:00';
+    const action = only(
+      decisionContext({
+        proposed_at: '2026-09-24T10:05:00+08:00',
+        policy_context: policyContext({ evaluated_at: evaluatedAt }),
+      }),
+    );
+
+    // 不变量：刚提出的建议一定满足 expires_at > evaluated_at，否则会被 Policy 立刻判 action_expired
+    expect(Date.parse(action.expires_at)).toBeGreaterThan(Date.parse(evaluatedAt));
   });
 
   it('缺少负责人时不提出需要负责人的自动动作', () => {
@@ -157,6 +183,19 @@ describe('RuleBasedDecider 互动与推进', () => {
       parameter_source: 'state',
     });
     expect(action.parameters).toMatchObject({ duration_minutes: 30, earliest_start_at: '2026-09-24T10:05:00+08:00' });
+  });
+
+  it('会议最早可开始时间锚定建议提出时刻，不会给出已经过去的时段', () => {
+    const action = only(
+      decisionContext({
+        proposed_at: '2026-09-30T10:05:00+08:00',
+        lead_state: leadState({ status: 'engaged' }),
+        recent_events: [emailSentEvent(), emailRepliedEvent()],
+        policy_context: policyContext({ evaluated_at: '2026-09-24T10:05:00+08:00' }),
+      }),
+    );
+
+    expect(action.parameters).toMatchObject({ earliest_start_at: '2026-09-30T10:05:00+08:00' });
   });
 
   it('已安排会议后不再重复提出', () => {
@@ -321,6 +360,26 @@ describe('RuleBasedDecider 逾期分支', () => {
     });
     expect(action.parameters).toMatchObject({ task_type: 'overdue_remedy', assigned_to: 'user_7' });
     expect(action.reason).toContain('task_1');
+  });
+
+  it('补救任务到期时间锚定建议提出时刻，不会出生即逾期', () => {
+    const action = only(
+      decisionContext({
+        proposed_at: '2026-09-30T10:05:00+08:00',
+        policy_context: policyContext({ evaluated_at: '2026-09-24T10:05:00+08:00' }),
+        pending_tasks: [
+          {
+            task_id: 'task_1',
+            task_type: 'follow_up',
+            assigned_to: 'user_7',
+            due_at: '2026-09-23T10:00:00+08:00',
+            status: 'overdue',
+          },
+        ],
+      }),
+    );
+
+    expect(action.parameters).toMatchObject({ due_at: '2026-10-01T02:05:00.000Z' });
   });
 
   it('未逾期任务不触发补救动作', () => {
