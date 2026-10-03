@@ -1,4 +1,4 @@
-DealFlow
+# DealFlow
 
 事件驱动、人机协同（Human-in-the-loop）的销售工作流引擎。
 
@@ -10,7 +10,7 @@ DealFlow
 
 这是什么
 
-DealFlow 把「一条线索从进线到成交/丢单」的跟进闭环，做成一个可恢复、可审计、可人审的事件驱动引擎：
+# DealFlow 把「一条线索从进线到成交/丢单」的跟进闭环，做成一个可恢复、可审计、可人审的事件驱动引擎：
 
 1. 接收并去重 lead.created；
 2. 为 Lead 分配负责人（lead.assigned）；
@@ -113,8 +113,8 @@ npm start / npm run dev / npm run backup 会自动加载仓库根目录的 .env�
           "contact_id": "contact_a", "initial_owner_id": null
         }
       }'
-    # → {"status":"processed","event_status":"processed",
-    #    "workflow_id":"wf_lead_follow_up_lead_a","workflow_status":"running"}
+     → {"status":"processed","event_status":"processed",
+        "workflow_id":"wf_lead_follow_up_lead_a","workflow_status":"running"}
     
     # 3) 看线索已落库（需要控制面 Token）
     curl -s -H 'Authorization: Bearer dev-token' http://127.0.0.1:3000/leads/lead_a
